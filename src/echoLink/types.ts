@@ -15,6 +15,10 @@ export type EchoLinkTrackPreview = {
   durationMs: number;
   sourceLabel: string;
   canPlayOnPhone: boolean;
+  codec?: string | null;
+  sampleRate?: number | null;
+  bitDepth?: number | null;
+  bitrate?: number | null;
 };
 
 export type EchoLinkAlbumPreview = {

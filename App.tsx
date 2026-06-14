@@ -30,6 +30,11 @@ import { loadSavedConnection, saveConnection } from './src/storage/connectionSto
 
 type AppPage = 'control' | 'library' | 'connect';
 type PlaybackOutputMode = 'pc' | 'phone';
+type PendingPcSeek = {
+  positionMs: number;
+  requestedAtMs: number;
+  trackId: string | null;
+};
 
 const formatTime = (milliseconds: number): string => {
   const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -43,6 +48,93 @@ const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
 const ratioFromGesture = (event: GestureResponderEvent, width: number): number => (
   width > 0 ? clamp01(event.nativeEvent.locationX / width) : 0
 );
+
+const formatSourceTag = (sourceLabel: string | null | undefined): string | null => {
+  const value = sourceLabel?.trim();
+  if (!value) {
+    return null;
+  }
+  if (/local/iu.test(value)) {
+    return 'Local';
+  }
+  if (/remote/iu.test(value)) {
+    return 'Remote';
+  }
+  if (/stream/iu.test(value)) {
+    return 'Streaming';
+  }
+  return value;
+};
+
+const formatOutputTag = (outputMode: string | null | undefined): string | null => {
+  const value = outputMode?.trim();
+  if (!value) {
+    return null;
+  }
+  if (/asio/iu.test(value)) {
+    return 'ASIO';
+  }
+  if (/wasapi|shared|exclusive/iu.test(value)) {
+    return 'WASAPI';
+  }
+  if (/system/iu.test(value)) {
+    return 'System';
+  }
+  return value;
+};
+
+const formatCodecTag = (codec: string | null | undefined): string | null => {
+  const value = codec?.trim();
+  return value ? value.toUpperCase() : null;
+};
+
+const formatSampleRateTag = (sampleRate: number | null | undefined): string | null => {
+  if (!Number.isFinite(sampleRate) || !sampleRate || sampleRate <= 0) {
+    return null;
+  }
+  const khz = sampleRate / 1000;
+  return `${Number.isInteger(khz) ? khz.toFixed(0) : khz.toFixed(1)}kHz`;
+};
+
+const formatBitDepthTag = (bitDepth: number | null | undefined): string | null => {
+  if (!Number.isFinite(bitDepth) || !bitDepth || bitDepth <= 0) {
+    return null;
+  }
+  return `${Math.round(bitDepth)}bit`;
+};
+
+const formatBitrateTag = (bitrate: number | null | undefined): string | null => {
+  if (!Number.isFinite(bitrate) || !bitrate || bitrate <= 0) {
+    return null;
+  }
+  const kbps = bitrate >= 1000 ? bitrate / 1000 : bitrate;
+  return `${Math.round(kbps)}kbps`;
+};
+
+const formatQualityTag = (track: EchoLinkTrackPreview | null | undefined): string | null => {
+  const sampleRate = formatSampleRateTag(track?.sampleRate);
+  const bitDepth = formatBitDepthTag(track?.bitDepth);
+  if (sampleRate && bitDepth) {
+    return `${sampleRate}/${bitDepth}`;
+  }
+  return sampleRate ?? bitDepth;
+};
+
+const tagsForTrack = (
+  track: EchoLinkTrackPreview | null | undefined,
+  options: { includeDuration?: boolean; outputMode?: string | null } = {},
+): string[] => {
+  const tags = [
+    formatOutputTag(options.outputMode),
+    formatSourceTag(track?.sourceLabel),
+    track ? (track.canPlayOnPhone ? '可串流' : '仅控制') : null,
+    formatCodecTag(track?.codec),
+    formatQualityTag(track),
+    formatBitrateTag(track?.bitrate),
+    options.includeDuration && track ? formatTime(track.durationMs) : null,
+  ];
+  return tags.filter((tag): tag is string => Boolean(tag && tag.trim()));
+};
 
 const initialConnection: EchoLinkConnection = {
   host: '',
@@ -140,6 +232,7 @@ function EchoLinkApp(): ReactElement {
   const statusPollInFlight = useRef(false);
   const sliderInteractionInFlight = useRef(false);
   const latestStatusRef = useRef<EchoLinkStatusResponse | null>(null);
+  const pendingPcSeekRef = useRef<PendingPcSeek | null>(null);
 
   const client = useMemo(() => (
     connection.host.trim() && connection.token.trim()
@@ -147,7 +240,21 @@ function EchoLinkApp(): ReactElement {
       : null
   ), [connection]);
 
-  const applyStatus = useCallback((nextStatus: EchoLinkStatusResponse) => {
+  const applyStatus = useCallback((nextStatus: EchoLinkStatusResponse, options: { force?: boolean } = {}) => {
+    const pendingSeek = pendingPcSeekRef.current;
+    if (pendingSeek && !options.force) {
+      const nextTrackId = nextStatus.playback.track?.id ?? null;
+      const pendingAgeMs = Date.now() - pendingSeek.requestedAtMs;
+      const expectedPositionMs = pendingSeek.positionMs + (
+        nextStatus.playback.state === 'playing' ? Math.max(0, pendingAgeMs) : 0
+      );
+      const closeEnough = Math.abs(nextStatus.playback.positionMs - expectedPositionMs) < 1200;
+
+      if (nextTrackId === pendingSeek.trackId && !closeEnough && pendingAgeMs < 3500) {
+        return;
+      }
+      pendingPcSeekRef.current = null;
+    }
     latestStatusRef.current = nextStatus;
     setStatus(nextStatus);
     setStatusReceivedAtMs(Date.now());
@@ -323,7 +430,7 @@ function EchoLinkApp(): ReactElement {
   const nowPlaying = status?.playback.track;
   const playbackQueue = status?.playback.queue;
   const playlistItems = playbackQueue?.items ?? [];
-  const visiblePlaylistItems = playlistItems.slice(0, 6);
+  const visiblePlaylistItems = playlistItems.slice(0, 8);
   const hiddenPlaylistItemCount = Math.max(0, playlistItems.length - visiblePlaylistItems.length);
   const isPhoneOutput = playbackOutputMode === 'phone';
   const displayTrack = isPhoneOutput ? phoneTrack ?? nowPlaying : nowPlaying;
@@ -347,6 +454,9 @@ function EchoLinkApp(): ReactElement {
   const outputVolume = isPhoneOutput ? phoneVolume : status?.playback.volume ?? 0;
   const volumePercent = Math.round(outputVolume * 100);
   const isPlaybackActive = isPhoneOutput ? phonePlayerStatus.playing : status?.playback.state === 'playing';
+  const playbackTags = tagsForTrack(displayTrack, {
+    outputMode: isPhoneOutput ? '串流' : status?.playback.outputMode,
+  });
 
   const playTrackOnPhone = useCallback(async (
     track: EchoLinkTrackPreview,
@@ -498,10 +608,17 @@ function EchoLinkApp(): ReactElement {
       }
       return;
     }
-    sliderInteractionInFlight.current = !commit;
+    sliderInteractionInFlight.current = true;
     patchPlayback({ positionMs });
     if (commit) {
-      void sendCommand({ command: 'seekTo', positionMs });
+      pendingPcSeekRef.current = {
+        positionMs,
+        requestedAtMs: Date.now(),
+        trackId: status?.playback.track?.id ?? null,
+      };
+      void sendCommand({ command: 'seekTo', positionMs }).finally(() => {
+        sliderInteractionInFlight.current = false;
+      });
     }
   }, [isPhoneOutput, patchPlayback, phonePlayer, playbackDurationMs, progressTrackWidth, sendCommand, status]);
 
@@ -546,17 +663,20 @@ function EchoLinkApp(): ReactElement {
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.root}>
         <View style={styles.pageShell}>
           <ScrollView
-            contentContainerStyle={styles.content}
-            refreshControl={<RefreshControl refreshing={busy} onRefresh={() => void refresh()} tintColor="#6f8f7a" />}
+            contentContainerStyle={[styles.content, page === 'control' ? styles.playerContent : null]}
+            refreshControl={<RefreshControl refreshing={busy} onRefresh={() => void refresh()} tintColor="#18181b" />}
+            scrollEnabled={page !== 'control'}
           >
-            <View style={styles.header}>
-              <Text style={styles.kicker}>ECHO iPhone</Text>
-              <Text style={styles.title}>{pageTitle}</Text>
-              <Text style={styles.description}>{pageDescription}</Text>
-              <View style={[styles.statusPill, status ? styles.statusPillOnline : null]}>
-                <Text style={[styles.statusPillText, status ? styles.statusPillTextOnline : null]}>{connectedLabel}</Text>
+            {page !== 'control' ? (
+              <View style={styles.header}>
+                <Text style={styles.kicker}>ECHO iPhone</Text>
+                <Text style={styles.title}>{pageTitle}</Text>
+                <Text style={styles.description}>{pageDescription}</Text>
+                <View style={[styles.statusPill, status ? styles.statusPillOnline : null]}>
+                  <Text style={[styles.statusPillText, status ? styles.statusPillTextOnline : null]}>{connectedLabel}</Text>
+                </View>
               </View>
-            </View>
+            ) : null}
 
             {error ? (
               <View style={styles.errorBox}>
@@ -682,11 +802,23 @@ function EchoLinkApp(): ReactElement {
                       style={styles.trackRow}
                       onPress={() => playTrackOnPc(item)}
                     >
+                      <View style={styles.libraryArtwork}>
+                        {item.artworkUrl ? (
+                          <Image source={{ uri: item.artworkUrl }} style={styles.libraryArtworkImage} />
+                        ) : (
+                          <Text style={styles.libraryArtworkText}>E</Text>
+                        )}
+                      </View>
                       <View style={styles.trackText}>
                         <Text style={styles.listTitle} numberOfLines={1}>{item.title}</Text>
-                        <Text style={styles.listMeta} numberOfLines={1}>{item.artist} · {item.sourceLabel}</Text>
+                        <Text style={styles.listMeta} numberOfLines={1}>{item.artist}</Text>
+                        <View style={styles.libraryTagRow}>
+                          {tagsForTrack(item, { includeDuration: true }).map((tag) => (
+                            <Text key={`${item.id}-${tag}`} style={styles.libraryTag}>{tag}</Text>
+                          ))}
+                        </View>
                       </View>
-                      <Text style={styles.playInline}>播放</Text>
+                      <Text style={styles.playInline}>▶</Text>
                     </Pressable>
                   )) : (
                     <Text style={styles.hint}>{client ? '暂无曲库结果' : '连接后会显示电脑端曲库'}</Text>
@@ -705,34 +837,33 @@ function EchoLinkApp(): ReactElement {
                       </View>
                     )}
                   </View>
-                  <Text style={styles.playerLabel}>
-                    {isPhoneOutput ? '手机正在播放电脑音乐' : status ? `${status.device.name} / ${status.playback.outputMode}` : '等待连接'}
-                  </Text>
                   <Text style={styles.trackTitle} numberOfLines={2}>{displayTrack?.title ?? '没有正在播放的歌曲'}</Text>
-                  <Text style={styles.trackMeta} numberOfLines={1}>
-                    {displayTrack ? `${displayTrack.artist} · ${displayTrack.album || 'Unknown Album'}` : '先连接电脑端 ECHO NEXT'}
-                  </Text>
+                  <View style={styles.playbackTagRow}>
+                    {playbackTags.map((tag) => (
+                      <Text key={tag} style={styles.playbackTag}>{tag}</Text>
+                    ))}
+                  </View>
                   <View style={styles.outputSwitch}>
                     <Pressable
-                      accessibilityLabel="操控电脑播放"
+                      accessibilityLabel="控制电脑播放"
                       accessibilityRole="button"
                       disabled={!client || phoneAudioBusy}
                       onPress={switchToPcPlayback}
                       style={[styles.outputSwitchButton, !isPhoneOutput ? styles.outputSwitchButtonActive : null]}
                     >
                       <Text style={[styles.outputSwitchText, !isPhoneOutput ? styles.outputSwitchTextActive : null]}>
-                        操控电脑播放
+                        控制
                       </Text>
                     </Pressable>
                     <Pressable
-                      accessibilityLabel="手机播放电脑音乐"
+                      accessibilityLabel="串流到手机播放"
                       accessibilityRole="button"
                       disabled={!client || phoneAudioBusy}
                       onPress={switchToPhonePlayback}
                       style={[styles.outputSwitchButton, isPhoneOutput ? styles.outputSwitchButtonActive : null]}
                     >
                       <Text style={[styles.outputSwitchText, isPhoneOutput ? styles.outputSwitchTextActive : null]}>
-                        {phoneAudioBusy ? '正在连接音乐' : '手机播放电脑音乐'}
+                        {phoneAudioBusy ? '...' : '串流'}
                       </Text>
                     </Pressable>
                   </View>
@@ -766,7 +897,7 @@ function EchoLinkApp(): ReactElement {
                       onPress={playPrevious}
                       disabled={!client && !isPhoneOutput}
                     >
-                      <Text style={styles.roundButtonText}>上一首</Text>
+                      <Text style={styles.roundButtonText}>‹</Text>
                     </Pressable>
                     <Pressable
                       accessibilityLabel={isPlaybackActive ? '暂停播放' : '开始播放'}
@@ -775,7 +906,7 @@ function EchoLinkApp(): ReactElement {
                       onPress={togglePlayPause}
                       disabled={!client && !isPhoneOutput}
                     >
-                      <Text style={styles.playButtonText}>{isPlaybackActive ? '暂停' : '播放'}</Text>
+                      <Text style={styles.playButtonText}>{isPlaybackActive ? 'Ⅱ' : '▶'}</Text>
                     </Pressable>
                     <Pressable
                       accessibilityLabel="下一首"
@@ -784,67 +915,27 @@ function EchoLinkApp(): ReactElement {
                       onPress={playNext}
                       disabled={!client && !isPhoneOutput}
                     >
-                      <Text style={styles.roundButtonText}>下一首</Text>
+                      <Text style={styles.roundButtonText}>›</Text>
                     </Pressable>
                   </View>
 
-                  <Pressable
-                    accessibilityLabel={playlistOpen ? '收起播放列表' : '展开播放列表'}
-                    accessibilityRole="button"
-                    onPress={() => setPlaylistOpen((current) => !current)}
-                    style={styles.playlistToggle}
-                  >
-                    <Text style={styles.playlistToggleText}>播放列表</Text>
-                    <Text style={styles.playlistToggleMeta}>
-                      {playlistItems.length > 0 ? `${playlistItems.length} 首` : '暂无队列'} {playlistOpen ? '⌃' : '⌄'}
-                    </Text>
-                  </Pressable>
-
-                  {playlistOpen ? (
-                    <View style={styles.playlistPanel}>
-                      {visiblePlaylistItems.length > 0 ? visiblePlaylistItems.map((item, index) => {
-                        const isCurrentTrack = item.id === playbackQueue?.currentTrackId || item.id === displayTrack?.id;
-                        return (
-                          <Pressable
-                            accessibilityLabel={`播放列表第 ${index + 1} 首：${item.title}`}
-                            accessibilityRole="button"
-                            key={`${item.id}-${index}`}
-                            onPress={() => {
-                              if (isPhoneOutput) {
-                                void playTrackOnPhone(item, 0, false);
-                                return;
-                              }
-                              playTrackOnPc(item);
-                            }}
-                            style={[styles.playlistItem, isCurrentTrack ? styles.playlistItemActive : null]}
-                          >
-                            <Text style={[styles.playlistIndex, isCurrentTrack ? styles.playlistIndexActive : null]}>
-                              {String(index + 1).padStart(2, '0')}
-                            </Text>
-                            <View style={styles.playlistText}>
-                              <Text style={[styles.playlistTitle, isCurrentTrack ? styles.playlistTitleActive : null]} numberOfLines={1}>
-                                {item.title}
-                              </Text>
-                              <Text style={styles.playlistMeta} numberOfLines={1}>
-                                {item.artist} · {item.album || item.sourceLabel}
-                              </Text>
-                            </View>
-                          </Pressable>
-                        );
-                      }) : (
-                        <Text style={styles.playlistEmpty}>当前播放队列暂无内容。之后这里会承接 PC 与手机互通的播放列表。</Text>
-                      )}
-                      {hiddenPlaylistItemCount > 0 ? (
-                        <Text style={styles.playlistMore}>还有 {hiddenPlaylistItemCount} 首在队列中</Text>
-                      ) : null}
-                    </View>
-                  ) : null}
+                  <View style={styles.playlistActionRow}>
+                    <Pressable
+                      accessibilityLabel={playlistOpen ? '关闭播放列表预览' : '打开播放列表预览'}
+                      accessibilityRole="button"
+                      onPress={() => setPlaylistOpen((current) => !current)}
+                      style={[styles.playlistMiniButton, playlistOpen ? styles.playlistMiniButtonActive : null]}
+                    >
+                      <Text style={styles.playlistMiniIcon}>☰</Text>
+                      <Text style={styles.playlistMiniCount}>{playlistItems.length}</Text>
+                    </Pressable>
+                  </View>
 
                   <View style={styles.playerDivider} />
                   <View style={styles.volumePanel}>
                     <View style={styles.volumeHeader}>
-                      <Text style={styles.cardEyebrow}>Volume</Text>
-                      <Text style={styles.volumeValue}>音量 {volumePercent}%</Text>
+                      <Text style={styles.cardEyebrow}>VOL</Text>
+                      <Text style={styles.volumeValue}>{volumePercent}%</Text>
                     </View>
                     <View
                       style={styles.sliderTouchArea}
@@ -866,6 +957,71 @@ function EchoLinkApp(): ReactElement {
               </>
             )}
           </ScrollView>
+
+          {page === 'control' && playlistOpen ? (
+            <View style={styles.playlistOverlay} pointerEvents="box-none">
+              <Pressable
+                accessibilityLabel="关闭播放列表预览"
+                accessibilityRole="button"
+                onPress={() => setPlaylistOpen(false)}
+                style={styles.playlistBackdrop}
+              />
+              <View style={styles.playlistPopover}>
+                <View style={styles.playlistPopoverHeader}>
+                  <View>
+                    <Text style={styles.playlistPopoverEyebrow}>Queue</Text>
+                    <Text style={styles.playlistPopoverTitle}>播放列表</Text>
+                  </View>
+                  <Pressable
+                    accessibilityLabel="关闭播放列表"
+                    accessibilityRole="button"
+                    onPress={() => setPlaylistOpen(false)}
+                    style={styles.playlistCloseButton}
+                  >
+                    <Text style={styles.playlistCloseText}>×</Text>
+                  </Pressable>
+                </View>
+                <View style={styles.playlistPopoverList}>
+                  {visiblePlaylistItems.length > 0 ? visiblePlaylistItems.map((item, index) => {
+                    const isCurrentTrack = item.id === playbackQueue?.currentTrackId || item.id === displayTrack?.id;
+                    return (
+                      <Pressable
+                        accessibilityLabel={`播放列表第 ${index + 1} 首：${item.title}`}
+                        accessibilityRole="button"
+                        key={`${item.id}-${index}`}
+                        onPress={() => {
+                          setPlaylistOpen(false);
+                          if (isPhoneOutput) {
+                            void playTrackOnPhone(item, 0, false);
+                            return;
+                          }
+                          playTrackOnPc(item);
+                        }}
+                        style={[styles.playlistItem, isCurrentTrack ? styles.playlistItemActive : null]}
+                      >
+                        <Text style={[styles.playlistIndex, isCurrentTrack ? styles.playlistIndexActive : null]}>
+                          {String(index + 1).padStart(2, '0')}
+                        </Text>
+                        <View style={styles.playlistText}>
+                          <Text style={[styles.playlistTitle, isCurrentTrack ? styles.playlistTitleActive : null]} numberOfLines={1}>
+                            {item.title}
+                          </Text>
+                          <Text style={styles.playlistMeta} numberOfLines={1}>
+                            {item.artist} · {item.album || item.sourceLabel}
+                          </Text>
+                        </View>
+                      </Pressable>
+                    );
+                  }) : (
+                    <Text style={styles.playlistEmpty}>当前播放队列暂无内容。之后这里会承接 PC 与手机互通的播放列表。</Text>
+                  )}
+                </View>
+                {hiddenPlaylistItemCount > 0 ? (
+                  <Text style={styles.playlistMore}>还有 {hiddenPlaylistItemCount} 首在队列中</Text>
+                ) : null}
+              </View>
+            </View>
+          ) : null}
 
           <View style={styles.dock}>
             <Pressable
@@ -913,7 +1069,7 @@ export default function App(): ReactElement {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#f7f4ef',
+    backgroundColor: '#f5f5f5',
   },
   root: {
     flex: 1,
@@ -922,9 +1078,15 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   content: {
-    padding: 20,
+    padding: 18,
     paddingBottom: 124,
-    gap: 18,
+    gap: 16,
+  },
+  playerContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingBottom: 106,
+    paddingTop: 10,
   },
   header: {
     gap: 10,
@@ -957,8 +1119,8 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
   },
   statusPillOnline: {
-    backgroundColor: 'rgba(244, 247, 241, 0.82)',
-    borderColor: 'rgba(111, 143, 122, 0.22)',
+    backgroundColor: 'rgba(255, 255, 255, 0.82)',
+    borderColor: 'rgba(24, 24, 27, 0.12)',
   },
   statusPillText: {
     color: '#706b66',
@@ -966,7 +1128,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   statusPillTextOnline: {
-    color: '#4f6f5a',
+    color: '#27272a',
   },
   card: {
     backgroundColor: 'rgba(255, 255, 255, 0.72)',
@@ -1020,7 +1182,7 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     alignItems: 'center',
-    backgroundColor: '#6f8f7a',
+    backgroundColor: '#18181b',
     borderRadius: 16,
     paddingVertical: 13,
   },
@@ -1083,17 +1245,17 @@ const styles = StyleSheet.create({
   },
   playerCard: {
     alignItems: 'center',
-    gap: 14,
+    gap: 9,
     paddingHorizontal: 2,
-    paddingTop: 4,
+    paddingTop: 0,
   },
   artworkShell: {
     alignItems: 'center',
-    backgroundColor: '#eef2ea',
+    backgroundColor: '#eeeeee',
     borderColor: 'rgba(39, 39, 42, 0.08)',
-    borderRadius: 30,
+    borderRadius: 22,
     borderWidth: 1,
-    height: 300,
+    height: 272,
     justifyContent: 'center',
     overflow: 'hidden',
     shadowColor: '#18181b',
@@ -1108,27 +1270,20 @@ const styles = StyleSheet.create({
   },
   artworkFallback: {
     alignItems: 'center',
-    backgroundColor: '#e8eee2',
+    backgroundColor: '#e5e5e5',
     height: '100%',
     justifyContent: 'center',
     width: '100%',
   },
   artworkFallbackText: {
-    color: '#6f8f7a',
+    color: '#71717a',
     fontSize: 40,
     fontWeight: '900',
     letterSpacing: 4,
   },
-  playerLabel: {
-    color: '#6f8f7a',
-    fontSize: 12,
-    fontWeight: '900',
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-  },
   trackTitle: {
     color: '#18181b',
-    fontSize: 26,
+    fontSize: 22,
     fontWeight: '900',
     textAlign: 'center',
   },
@@ -1137,9 +1292,27 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
   },
+  playbackTagRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    justifyContent: 'center',
+    minHeight: 24,
+  },
+  playbackTag: {
+    borderColor: 'rgba(24, 24, 27, 0.12)',
+    borderRadius: 999,
+    borderWidth: 1,
+    color: '#3f3f46',
+    fontSize: 11,
+    fontWeight: '800',
+    overflow: 'hidden',
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+  },
   outputSwitch: {
     alignSelf: 'stretch',
-    backgroundColor: 'rgba(255, 255, 255, 0.44)',
+    backgroundColor: 'rgba(255, 255, 255, 0.68)',
     borderColor: 'rgba(39, 39, 42, 0.08)',
     borderRadius: 999,
     borderWidth: 1,
@@ -1151,7 +1324,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 999,
     flex: 1,
-    minHeight: 36,
+    minHeight: 32,
     justifyContent: 'center',
     paddingHorizontal: 10,
   },
@@ -1168,7 +1341,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   outputSwitchTextActive: {
-    color: '#4f6f5a',
+    color: '#18181b',
   },
   phoneAudioError: {
     alignSelf: 'stretch',
@@ -1178,7 +1351,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   progressTrack: {
-    backgroundColor: '#e4ebdd',
+    backgroundColor: '#e5e5e5',
     borderRadius: 999,
     height: 8,
     overflow: 'hidden',
@@ -1192,7 +1365,7 @@ const styles = StyleSheet.create({
   },
   sliderThumb: {
     backgroundColor: '#ffffff',
-    borderColor: '#6f8f7a',
+    borderColor: '#18181b',
     borderRadius: 999,
     borderWidth: 3,
     height: 22,
@@ -1207,7 +1380,7 @@ const styles = StyleSheet.create({
     width: 22,
   },
   progressFill: {
-    backgroundColor: '#6f8f7a',
+    backgroundColor: '#18181b',
     borderRadius: 999,
     height: '100%',
   },
@@ -1234,49 +1407,131 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     borderWidth: 1,
     flex: 1,
-    paddingVertical: 12,
+    minHeight: 42,
+    paddingVertical: 8,
   },
   roundButtonText: {
     color: '#27272a',
-    fontWeight: '800',
+    fontSize: 26,
+    fontWeight: '900',
   },
   playButton: {
     alignItems: 'center',
-    backgroundColor: '#6f8f7a',
+    backgroundColor: '#18181b',
     borderRadius: 999,
     flex: 1,
-    paddingVertical: 13,
+    minHeight: 44,
+    paddingVertical: 8,
   },
   playButtonText: {
     color: '#ffffff',
+    fontSize: 18,
     fontWeight: '900',
   },
-  playlistToggle: {
+  playlistActionRow: {
     alignItems: 'center',
-    alignSelf: 'stretch',
-    backgroundColor: 'rgba(255, 255, 255, 0.42)',
-    borderColor: 'rgba(39, 39, 42, 0.08)',
-    borderRadius: 18,
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: -4,
+    width: '100%',
+  },
+  playlistMiniButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.72)',
+    borderColor: 'rgba(39, 39, 42, 0.1)',
+    borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    minHeight: 44,
-    paddingHorizontal: 14,
+    gap: 7,
+    minHeight: 34,
+    paddingHorizontal: 12,
+    shadowColor: '#18181b',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.06,
+    shadowRadius: 16,
   },
-  playlistToggleText: {
+  playlistMiniButtonActive: {
+    backgroundColor: '#ffffff',
+    borderColor: 'rgba(24, 24, 27, 0.18)',
+  },
+  playlistMiniIcon: {
     color: '#18181b',
-    fontSize: 14,
-    fontWeight: '800',
+    fontSize: 15,
+    fontWeight: '900',
   },
-  playlistToggleMeta: {
+  playlistMiniCount: {
     color: '#706b66',
-    fontSize: 13,
-    fontWeight: '700',
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
+    fontWeight: '900',
   },
-  playlistPanel: {
-    alignSelf: 'stretch',
+  playlistOverlay: {
+    bottom: 0,
+    justifyContent: 'center',
+    left: 0,
+    paddingBottom: 116,
+    paddingHorizontal: 22,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    zIndex: 20,
+  },
+  playlistBackdrop: {
+    backgroundColor: 'rgba(245, 245, 245, 0.38)',
+    bottom: 0,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  playlistPopover: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    borderColor: 'rgba(39, 39, 42, 0.1)',
+    borderRadius: 24,
+    borderWidth: 1,
+    maxHeight: 380,
+    padding: 16,
+    shadowColor: '#18181b',
+    shadowOffset: { width: 0, height: 22 },
+    shadowOpacity: 0.14,
+    shadowRadius: 36,
+    width: '100%',
+  },
+  playlistPopoverHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  playlistPopoverEyebrow: {
+    color: '#8a8178',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+  },
+  playlistPopoverTitle: {
+    color: '#18181b',
+    fontSize: 19,
+    fontWeight: '900',
+  },
+  playlistCloseButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(244, 244, 245, 0.92)',
+    borderRadius: 999,
+    height: 34,
+    justifyContent: 'center',
+    width: 34,
+  },
+  playlistCloseText: {
+    color: '#3f3f46',
+    fontSize: 22,
+    fontWeight: '600',
+    lineHeight: 24,
+  },
+  playlistPopoverList: {
     gap: 0,
-    maxHeight: 220,
   },
   playlistItem: {
     alignItems: 'center',
@@ -1288,7 +1543,7 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   playlistItemActive: {
-    backgroundColor: 'rgba(111, 143, 122, 0.08)',
+    backgroundColor: 'rgba(24, 24, 27, 0.06)',
     borderRadius: 14,
     borderBottomWidth: 0,
     paddingHorizontal: 10,
@@ -1301,7 +1556,7 @@ const styles = StyleSheet.create({
     width: 24,
   },
   playlistIndexActive: {
-    color: '#4f6f5a',
+    color: '#18181b',
   },
   playlistText: {
     flex: 1,
@@ -1313,7 +1568,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   playlistTitleActive: {
-    color: '#4f6f5a',
+    color: '#18181b',
   },
   playlistMeta: {
     color: '#706b66',
@@ -1348,18 +1603,18 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   volumeValue: {
-    color: '#4f6f5a',
+    color: '#18181b',
     fontSize: 14,
     fontWeight: '900',
   },
   volumeTrack: {
-    backgroundColor: '#e4ebdd',
+    backgroundColor: '#e5e5e5',
     borderRadius: 999,
     height: 12,
     overflow: 'hidden',
   },
   volumeFill: {
-    backgroundColor: '#6f8f7a',
+    backgroundColor: '#18181b',
     borderRadius: 999,
     height: '100%',
   },
@@ -1388,7 +1643,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   libraryRefreshText: {
-    color: '#4f6f5a',
+    color: '#27272a',
     fontSize: 14,
     fontWeight: '800',
   },
@@ -1398,19 +1653,39 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     flexDirection: 'row',
     gap: 12,
-    minHeight: 58,
-    paddingVertical: 12,
+    minHeight: 66,
+    paddingVertical: 10,
+  },
+  libraryArtwork: {
+    alignItems: 'center',
+    backgroundColor: '#e5e5e5',
+    borderColor: 'rgba(39, 39, 42, 0.08)',
+    borderRadius: 12,
+    borderWidth: 1,
+    height: 46,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    width: 46,
+  },
+  libraryArtworkImage: {
+    height: '100%',
+    width: '100%',
+  },
+  libraryArtworkText: {
+    color: '#71717a',
+    fontSize: 16,
+    fontWeight: '900',
   },
   trackBadge: {
     alignItems: 'center',
-    backgroundColor: '#e4ebdd',
+    backgroundColor: '#e5e5e5',
     borderRadius: 999,
     height: 34,
     justifyContent: 'center',
     width: 34,
   },
   trackBadgeText: {
-    color: '#4f6f5a',
+    color: '#52525b',
     fontSize: 16,
     fontWeight: '900',
   },
@@ -1425,12 +1700,28 @@ const styles = StyleSheet.create({
   },
   listMeta: {
     color: '#706b66',
-    fontSize: 13,
+    fontSize: 12,
+  },
+  libraryTagRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 5,
+  },
+  libraryTag: {
+    borderColor: 'rgba(24, 24, 27, 0.12)',
+    borderRadius: 999,
+    borderWidth: 1,
+    color: '#52525b',
+    fontSize: 10,
+    fontWeight: '800',
+    overflow: 'hidden',
+    paddingHorizontal: 7,
+    paddingVertical: 2,
   },
   playInline: {
-    color: '#4f6f5a',
-    fontSize: 13,
-    fontWeight: '800',
+    color: '#18181b',
+    fontSize: 15,
+    fontWeight: '900',
   },
   dock: {
     alignItems: 'center',
@@ -1460,7 +1751,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   dockItemActive: {
-    backgroundColor: 'rgba(111, 143, 122, 0.16)',
+    backgroundColor: 'rgba(24, 24, 27, 0.1)',
   },
   dockIcon: {
     color: '#8a8178',
@@ -1468,7 +1759,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   dockIconActive: {
-    color: '#4f6f5a',
+    color: '#18181b',
   },
   dockLabel: {
     color: '#8a8178',
@@ -1476,6 +1767,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   dockLabelActive: {
-    color: '#4f6f5a',
+    color: '#18181b',
   },
 });
