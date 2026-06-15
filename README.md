@@ -5,15 +5,12 @@
 <h1 align="center">ECHO iPhone</h1>
 
 <p align="center">
-  一个为 <a href="https://github.com/Moekotori/ECHO">ECHO NEXT</a> 打造的 iPhone 音乐播放器式伴侣应用。
+  一个为 <a href="https://github.com/Moekotori/ECHO">ECHO NEXT</a> 打造的 iPhone 音乐播放器应用。
 </p>
 
-<<<<<<< HEAD
 <p align="center">
   <a href="README.en.md">English</a> · <strong>中文</strong> · <a href="RELEASE_NOTES.md">Release Notes</a>
 </p>
-=======
->>>>>>> 5dba9f355773e2c8d60c232faf2a0080f39567c6
 
 ![ECHO iPhone preview](docs/preview.svg)
 
