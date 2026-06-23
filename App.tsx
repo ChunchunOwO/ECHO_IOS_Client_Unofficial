@@ -34,15 +34,41 @@ import type { EchoLinkStatusResponse, EchoLinkTrackPreview } from './src/echoLin
 import { parsePairingUri } from './src/echoLink/pairing';
 import { loadSavedConnection, saveConnection } from './src/storage/connectionStore';
 
-type AppPage = 'control' | 'library' | 'connect';
+type AppPage = 'control' | 'library' | 'connect' | 'settings';
 type PlaybackOutputMode = 'pc' | 'phone';
+type LibraryFilter = 'all' | 'streamable' | 'local';
+type AppLanguage = 'zh' | 'en';
+type AudioTagKey = 'output' | 'source' | 'streamability' | 'quality' | 'bitrate' | 'duration';
+type AudioTagVisibility = Record<AudioTagKey, boolean>;
 type PendingPcSeek = {
   positionMs: number;
   requestedAtMs: number;
   trackId: string | null;
 };
 
-const appPages: AppPage[] = ['control', 'library', 'connect'];
+const appPages: AppPage[] = ['control', 'library', 'connect', 'settings'];
+const defaultAudioTagVisibility: AudioTagVisibility = {
+  bitrate: true,
+  duration: true,
+  output: true,
+  quality: true,
+  source: true,
+  streamability: true,
+};
+const audioTagOptions: Array<{
+  descriptionEn: string;
+  descriptionZh: string;
+  key: AudioTagKey;
+  labelEn: string;
+  labelZh: string;
+}> = [
+  { key: 'output', labelZh: '输出模式', labelEn: 'Output', descriptionZh: 'WASAPI / ASIO / 串流', descriptionEn: 'WASAPI / ASIO / Stream' },
+  { key: 'source', labelZh: '来源', labelEn: 'Source', descriptionZh: 'Local / Remote', descriptionEn: 'Local / Remote' },
+  { key: 'streamability', labelZh: '串流能力', labelEn: 'Streamable', descriptionZh: '可串流 / 仅控制', descriptionEn: 'Streamable / Control only' },
+  { key: 'quality', labelZh: '格式音质', labelEn: 'Quality', descriptionZh: 'FLAC 48kHz/24bit', descriptionEn: 'FLAC 48kHz/24bit' },
+  { key: 'bitrate', labelZh: '码率', labelEn: 'Bitrate', descriptionZh: '921kbps', descriptionEn: '921kbps' },
+  { key: 'duration', labelZh: '时长', labelEn: 'Duration', descriptionZh: '曲库列表显示', descriptionEn: 'Shown in library rows' },
+];
 
 type LyricLine = {
   id: string;
@@ -138,7 +164,7 @@ const formatSampleRateTag = (sampleRate: number | null | undefined): string | nu
   if (!Number.isFinite(sampleRate) || !sampleRate || sampleRate <= 0) {
     return null;
   }
-  const khz = sampleRate / 1000;
+  const khz = sampleRate >= 1000 ? sampleRate / 1000 : sampleRate;
   return `${Number.isInteger(khz) ? khz.toFixed(0) : khz.toFixed(1)}kHz`;
 };
 
@@ -166,18 +192,31 @@ const formatQualityTag = (track: EchoLinkTrackPreview | null | undefined): strin
   return sampleRate ?? bitDepth;
 };
 
+const formatAudioQualityTag = (track: EchoLinkTrackPreview | null | undefined): string | null => {
+  const codec = formatCodecTag(track?.codec);
+  const quality = formatQualityTag(track);
+  if (codec && quality) {
+    return `${codec} ${quality}`;
+  }
+  return codec ?? quality;
+};
+
 const tagsForTrack = (
   track: EchoLinkTrackPreview | null | undefined,
-  options: { includeDuration?: boolean; outputMode?: string | null } = {},
+  options: {
+    includeDuration?: boolean;
+    outputMode?: string | null;
+    visibleAudioTags?: AudioTagVisibility;
+  } = {},
 ): string[] => {
+  const visibleTags = options.visibleAudioTags ?? defaultAudioTagVisibility;
   const tags = [
-    formatOutputTag(options.outputMode),
-    formatSourceTag(track?.sourceLabel),
-    track ? (track.canPlayOnPhone ? '可串流' : '仅控制') : null,
-    formatCodecTag(track?.codec),
-    formatQualityTag(track),
-    formatBitrateTag(track?.bitrate),
-    options.includeDuration && track ? formatTime(track.durationMs) : null,
+    visibleTags.output ? formatOutputTag(options.outputMode) : null,
+    visibleTags.source ? formatSourceTag(track?.sourceLabel) : null,
+    visibleTags.streamability && track ? (track.canPlayOnPhone ? '可串流' : '仅控制') : null,
+    visibleTags.quality ? formatAudioQualityTag(track) : null,
+    visibleTags.bitrate ? formatBitrateTag(track?.bitrate) : null,
+    visibleTags.duration && options.includeDuration && track ? formatTime(track.durationMs) : null,
   ];
   return tags.filter((tag): tag is string => Boolean(tag && tag.trim()));
 };
@@ -265,6 +304,9 @@ function EchoLinkApp(): ReactElement {
   const [clockMs, setClockMs] = useState(() => Date.now());
   const [tracks, setTracks] = useState<EchoLinkTrackPreview[]>([]);
   const [query, setQuery] = useState('');
+  const [libraryFilter, setLibraryFilter] = useState<LibraryFilter>('all');
+  const [appLanguage, setAppLanguage] = useState<AppLanguage>('zh');
+  const [audioTagVisibility, setAudioTagVisibility] = useState<AudioTagVisibility>(defaultAudioTagVisibility);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [libraryError, setLibraryError] = useState<string | null>(null);
@@ -689,7 +731,24 @@ function EchoLinkApp(): ReactElement {
   const isPlaybackActive = isPhoneOutput ? phonePlayerStatus.playing : status?.playback.state === 'playing';
   const playbackTags = tagsForTrack(displayTrack, {
     outputMode: isPhoneOutput ? '串流' : status?.playback.outputMode,
+    visibleAudioTags: audioTagVisibility,
   });
+  const visibleTracks = useMemo(() => tracks.filter((track) => {
+    if (libraryFilter === 'streamable') {
+      return track.canPlayOnPhone;
+    }
+    if (libraryFilter === 'local') {
+      return formatSourceTag(track.sourceLabel) === 'Local';
+    }
+    return true;
+  }), [libraryFilter, tracks]);
+  const streamableTrackCount = useMemo(() => (
+    tracks.filter((track) => track.canPlayOnPhone).length
+  ), [tracks]);
+  const localTrackCount = useMemo(() => (
+    tracks.filter((track) => formatSourceTag(track.sourceLabel) === 'Local').length
+  ), [tracks]);
+  const visibleAudioTagCount = audioTagOptions.filter((option) => audioTagVisibility[option.key]).length;
   const lyricLines = useMemo(() => {
     if (lyricsLoading) {
       return [{ id: 'loading', text: '正在载入歌词...', timeMs: null }];
@@ -756,11 +815,11 @@ function EchoLinkApp(): ReactElement {
       },
     ],
   };
-  const isCompactPlayer = windowWidth < 390 || windowHeight < 760;
-  const playerCoverSize = isCompactPlayer ? Math.min(windowWidth - 92, 228) : Math.min(windowWidth - 80, 272);
-  const playerShellPadding = isCompactPlayer ? 14 : 18;
-  const playerShellGap = isCompactPlayer ? 10 : 14;
-  const playerTitleSize = isCompactPlayer ? 21 : 24;
+  const isCompactPlayer = windowWidth < 390 || windowHeight < 820;
+  const playerCoverSize = isCompactPlayer ? Math.min(windowWidth - 118, 184) : Math.min(windowWidth - 96, 236);
+  const playerShellPadding = isCompactPlayer ? 12 : 16;
+  const playerShellGap = isCompactPlayer ? 9 : 12;
+  const playerTitleSize = isCompactPlayer ? 20 : 23;
   const renderButtonBlur = (intensity = 22) => (
     <BlurView
       intensity={intensity}
@@ -1128,16 +1187,28 @@ function EchoLinkApp(): ReactElement {
     setVolumeTrackWidth(event.nativeEvent.layout.width);
   }, []);
 
+  const toggleAudioTagVisibility = useCallback((key: AudioTagKey) => {
+    setAudioTagVisibility((current) => ({
+      ...current,
+      [key]: !current[key],
+    }));
+  }, []);
+
+  const languageIsEnglish = appLanguage === 'en';
   const pageTitle = page === 'connect'
-    ? '连接电脑'
+    ? (languageIsEnglish ? 'Connect' : '连接电脑')
     : page === 'library'
-      ? '曲库'
-      : '正在播放';
+      ? (languageIsEnglish ? 'Library' : '曲库')
+      : page === 'settings'
+        ? (languageIsEnglish ? 'Settings' : '设置')
+        : (languageIsEnglish ? 'Now Playing' : '正在播放');
   const pageDescription = page === 'connect'
-    ? '用配对链接或局域网地址，让手机与 ECHO NEXT 桌面端建立同一套音乐空间。'
+    ? (languageIsEnglish ? 'Pair iPhone with ECHO NEXT on your local network.' : '用配对链接或局域网地址，让手机与 ECHO NEXT 桌面端建立同一套音乐空间。')
     : page === 'library'
-      ? '浏览电脑端本地曲库，把歌曲从 PC 端自然接到手机端体验里。'
-      : '同步 PC 端当前播放、曲库与音量，让手机和电脑保持同一段聆听进度。';
+      ? (languageIsEnglish ? 'Browse the desktop library and choose what moves to the phone.' : '浏览电脑端本地曲库，把歌曲从 PC 端自然接到手机端体验里。')
+      : page === 'settings'
+        ? (languageIsEnglish ? 'Choose app language and which audio tags stay visible.' : '选择界面语言，以及播放页和曲库里展示哪些音频 tag。')
+        : (languageIsEnglish ? 'Keep phone and desktop playback in the same listening flow.' : '同步 PC 端当前播放、曲库与音量，让手机和电脑保持同一段聆听进度。');
   const pageAnimatedStyle = {
     opacity: pageTransition,
     transform: [
@@ -1162,7 +1233,7 @@ function EchoLinkApp(): ReactElement {
     ],
   };
   const renderArtwork = (variant: 'default' | 'lyrics') => {
-    const artworkSize = variant === 'lyrics' ? (isCompactPlayer ? 104 : 120) : playerCoverSize;
+    const artworkSize = variant === 'lyrics' ? (isCompactPlayer ? 88 : 104) : playerCoverSize;
     return (
     <View
       style={[
@@ -1323,7 +1394,7 @@ function EchoLinkApp(): ReactElement {
         disabled={!client && !isPhoneOutput}
       >
         {renderButtonBlur(24)}
-        <Text style={[styles.roundButtonText, lyricsMode ? styles.roundButtonTextLyrics : null]}>‹</Text>
+        <Text style={[styles.roundButtonText, lyricsMode ? styles.roundButtonTextLyrics : null]}>‹‹</Text>
       </Pressable>
       <Pressable
         accessibilityLabel={isPlaybackActive ? '暂停播放' : '开始播放'}
@@ -1347,7 +1418,37 @@ function EchoLinkApp(): ReactElement {
         disabled={!client && !isPhoneOutput}
       >
         {renderButtonBlur(24)}
-        <Text style={[styles.roundButtonText, lyricsMode ? styles.roundButtonTextLyrics : null]}>›</Text>
+        <Text style={[styles.roundButtonText, lyricsMode ? styles.roundButtonTextLyrics : null]}>››</Text>
+      </Pressable>
+    </View>
+  );
+  const renderLyricsHeader = () => (
+    <View style={styles.lyricsTopBar}>
+      {renderArtwork('lyrics')}
+      <View style={styles.lyricsHeroText}>
+        <Text style={[styles.trackTitleLyrics, { fontSize: playerTitleSize }]} numberOfLines={2}>
+          {displayTrack?.title ?? '没有正在播放的歌曲'}
+        </Text>
+        <Text style={[
+          styles.lyricsConnectionText,
+          echoConnectionBroken ? styles.lyricsConnectionTextError : null,
+        ]} numberOfLines={1}>
+          {connectedLabel}
+        </Text>
+        <View style={[styles.playbackTagRow, styles.playbackTagRowLyrics]}>
+          {playbackTags.map((tag) => (
+            <Text key={tag} style={[styles.playbackTag, styles.playbackTagDark]}>{tag}</Text>
+          ))}
+        </View>
+      </View>
+      <Pressable
+        accessibilityLabel="关闭歌词显示"
+        accessibilityRole="button"
+        onPress={() => setLyricsVisible(false)}
+        style={styles.lyricsCloseButton}
+      >
+        {renderButtonBlur(18)}
+        <Text style={styles.lyricsCloseText}>×</Text>
       </Pressable>
     </View>
   );
@@ -1384,6 +1485,7 @@ function EchoLinkApp(): ReactElement {
         <Text style={styles.playlistMiniIcon}>☰</Text>
         <Text style={styles.playlistMiniCount}>{playlistItems.length}</Text>
       </Pressable>
+      {compact ? null : renderExpandableVolume()}
     </View>
   );
 
@@ -1398,7 +1500,7 @@ function EchoLinkApp(): ReactElement {
               page === 'control' && lyricsVisible ? styles.playerContentLyrics : null,
             ]}
             refreshControl={<RefreshControl refreshing={busy} onRefresh={() => void refresh()} tintColor="#18181b" />}
-            scrollEnabled={page !== 'control'}
+            scrollEnabled={page !== 'control' || lyricsVisible || volumeExpanded}
           >
             <Animated.View style={[styles.pageTransition, pageAnimatedStyle]}>
             {page !== 'control' ? (
@@ -1426,13 +1528,31 @@ function EchoLinkApp(): ReactElement {
             ) : null}
 
             {page === 'connect' ? (
-              <>
-                <View style={styles.section}>
-                  <Text style={styles.cardEyebrow}>Pair</Text>
-                  <Text style={styles.cardTitle}>配对连接</Text>
-                  <Text style={styles.hint}>
-                    在电脑端打开 Connect / Mobile ECHO Link，复制或扫描二维码里的 echo://pair 链接，然后粘贴到这里。
-                  </Text>
+              <View style={styles.connectPage}>
+                <View style={styles.connectHero}>
+                  <BlurView intensity={28} pointerEvents="none" style={styles.playerCardBlur} tint="dark" />
+                  <Text style={styles.connectHeroKicker}>EchoLink</Text>
+                  <Text style={styles.connectHeroTitle}>{connectedLabel}</Text>
+                  <Text style={styles.connectHeroText}>用局域网把 iPhone 接到 ECHO NEXT，播放、曲库、歌词和串流都从这里开始。</Text>
+                  <View style={styles.connectMetricRow}>
+                    <View style={styles.connectMetric}>
+                      <Text style={styles.connectMetricValue} numberOfLines={1}>{connection.host || '--'}</Text>
+                      <Text style={styles.connectMetricLabel}>Host</Text>
+                    </View>
+                    <View style={styles.connectMetric}>
+                      <Text style={styles.connectMetricValue}>{tracks.length}</Text>
+                      <Text style={styles.connectMetricLabel}>曲库</Text>
+                    </View>
+                    <View style={styles.connectMetric}>
+                      <Text style={styles.connectMetricValue}>{streamableTrackCount}</Text>
+                      <Text style={styles.connectMetricLabel}>可串流</Text>
+                    </View>
+                  </View>
+                </View>
+
+                <View style={styles.connectPanel}>
+                  <Text style={styles.cardEyebrow}>Pair Link</Text>
+                  <Text style={styles.cardTitle}>粘贴配对链接</Text>
                   <TextInput
                     value={pairingText}
                     onChangeText={setPairingText}
@@ -1451,13 +1571,13 @@ function EchoLinkApp(): ReactElement {
                   >
                     {renderButtonBlur(12)}
                     <Text style={styles.primaryButtonIcon}>↗</Text>
-                    <Text style={styles.primaryButtonText}>使用配对链接</Text>
+                    <Text style={styles.primaryButtonText}>连接</Text>
                   </Pressable>
                 </View>
 
-                <View style={styles.section}>
+                <View style={styles.connectPanel}>
                   <Text style={styles.cardEyebrow}>Manual</Text>
-                  <Text style={styles.cardTitle}>手动连接</Text>
+                  <Text style={styles.cardTitle}>手动输入</Text>
                   <TextInput
                     value={connection.host}
                     onChangeText={(host) => setConnection((current) => ({ ...current, host }))}
@@ -1494,7 +1614,7 @@ function EchoLinkApp(): ReactElement {
                     >
                       {renderButtonBlur(24)}
                       <Text style={styles.secondaryButtonIcon}>✓</Text>
-                      <Text style={styles.secondaryButtonText}>保存连接</Text>
+                      <Text style={styles.secondaryButtonText}>保存</Text>
                     </Pressable>
                     <Pressable
                       accessibilityLabel="测试电脑连接"
@@ -1505,13 +1625,18 @@ function EchoLinkApp(): ReactElement {
                     >
                       {renderButtonBlur(24)}
                       <Text style={styles.secondaryButtonIcon}>↻</Text>
-                      <Text style={styles.secondaryButtonText}>{busy ? '刷新中...' : '测试连接'}</Text>
+                      <Text style={styles.secondaryButtonText}>{busy ? '测试中' : '测试'}</Text>
                     </Pressable>
                   </View>
                 </View>
-              </>
+              </View>
             ) : page === 'library' ? (
               <View style={styles.libraryPage}>
+                <View style={styles.libraryHero}>
+                  <Text style={styles.connectHeroKicker}>Library</Text>
+                  <Text style={styles.libraryHeroTitle}>{tracks.length} 首</Text>
+                  <Text style={styles.connectHeroText}>从电脑曲库里挑歌，能串流的可以直接交给手机播放。</Text>
+                </View>
                 <View style={styles.librarySearchRow}>
                   <TextInput
                     value={query}
@@ -1533,18 +1658,42 @@ function EchoLinkApp(): ReactElement {
                     <Text style={styles.libraryRefreshText}>{busy ? '同步中' : '刷新'}</Text>
                   </Pressable>
                 </View>
+                <View style={styles.libraryFilterRow}>
+                  {([
+                    ['all', `全部 ${tracks.length}`],
+                    ['streamable', `可串流 ${streamableTrackCount}`],
+                    ['local', `本地 ${localTrackCount}`],
+                  ] as const).map(([value, label]) => (
+                    <Pressable
+                      accessibilityLabel={`筛选${label}`}
+                      accessibilityRole="button"
+                      key={value}
+                      onPress={() => setLibraryFilter(value)}
+                      style={[styles.libraryFilterChip, libraryFilter === value ? styles.libraryFilterChipActive : null]}
+                    >
+                      {renderButtonBlur(libraryFilter === value ? 10 : 20)}
+                      <Text style={[styles.libraryFilterText, libraryFilter === value ? styles.libraryFilterTextActive : null]}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
 
                 <View style={styles.libraryList}>
-                  {tracks.length > 0 ? tracks.map((item) => {
+                  {visibleTracks.length > 0 ? visibleTracks.map((item) => {
                     const itemArtworkUrl = resolveArtworkUrl(item.artworkUrl);
                     const itemArtworkVisible = artworkUrlIsVisible(itemArtworkUrl);
                     return (
                       <Pressable
-                        accessibilityLabel={`在电脑端播放 ${item.title}`}
+                        accessibilityLabel={`${isPhoneOutput && item.canPlayOnPhone ? '串流到手机播放' : '在电脑端播放'} ${item.title}`}
                         accessibilityRole="button"
                         key={item.id}
                         style={styles.trackRow}
-                        onPress={() => playTrackOnPc(item)}
+                        onPress={() => {
+                          if (isPhoneOutput && item.canPlayOnPhone) {
+                            void playTrackOnPhone(item, 0, false);
+                            return;
+                          }
+                          playTrackOnPc(item);
+                        }}
                       >
                         <View style={styles.libraryArtwork}>
                           <View style={styles.libraryArtworkFallback}>
@@ -1568,7 +1717,7 @@ function EchoLinkApp(): ReactElement {
                           <Text style={styles.listTitle} numberOfLines={1}>{item.title}</Text>
                           <Text style={styles.listMeta} numberOfLines={1}>{item.artist}</Text>
                           <View style={styles.libraryTagRow}>
-                            {tagsForTrack(item, { includeDuration: true }).map((tag) => (
+                            {tagsForTrack(item, { includeDuration: true, visibleAudioTags: audioTagVisibility }).map((tag) => (
                               <Text key={`${item.id}-${tag}`} style={styles.libraryTag}>{tag}</Text>
                             ))}
                           </View>
@@ -1577,8 +1726,67 @@ function EchoLinkApp(): ReactElement {
                       </Pressable>
                     );
                   }) : (
-                    <Text style={styles.hint}>{client ? '暂无曲库结果' : '连接后会显示电脑端曲库'}</Text>
+                    <Text style={styles.hint}>{client ? '没有匹配的歌曲' : '连接后会显示电脑端曲库'}</Text>
                   )}
+                </View>
+              </View>
+            ) : page === 'settings' ? (
+              <View style={styles.settingsPage}>
+                <View style={styles.settingsPanel}>
+                  <Text style={styles.cardEyebrow}>{languageIsEnglish ? 'Language' : '语言'}</Text>
+                  <Text style={styles.cardTitle}>{languageIsEnglish ? 'Interface Language' : '界面语言'}</Text>
+                  <View style={styles.segmentRow}>
+                    {([
+                      ['zh', '中文'],
+                      ['en', 'English'],
+                    ] as const).map(([value, label]) => (
+                      <Pressable
+                        accessibilityLabel={`${languageIsEnglish ? 'Set language to' : '切换语言到'} ${label}`}
+                        accessibilityRole="button"
+                        key={value}
+                        onPress={() => setAppLanguage(value)}
+                        style={[styles.segmentButton, appLanguage === value ? styles.segmentButtonActive : null]}
+                      >
+                        {renderButtonBlur(appLanguage === value ? 10 : 20)}
+                        <Text style={[styles.segmentButtonText, appLanguage === value ? styles.segmentButtonTextActive : null]}>{label}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  <Text style={styles.hint}>
+                    {languageIsEnglish
+                      ? 'This currently affects navigation and settings copy.'
+                      : '当前先影响导航和设置页文案，后续再扩展到全量界面。'}
+                  </Text>
+                </View>
+
+                <View style={styles.settingsPanel}>
+                  <Text style={styles.cardEyebrow}>Audio Tags</Text>
+                  <Text style={styles.cardTitle}>
+                    {languageIsEnglish ? `${visibleAudioTagCount} visible` : `已显示 ${visibleAudioTagCount} 项`}
+                  </Text>
+                  <View style={styles.settingsList}>
+                    {audioTagOptions.map((option) => {
+                      const enabled = audioTagVisibility[option.key];
+                      return (
+                        <Pressable
+                          accessibilityLabel={`${enabled ? (languageIsEnglish ? 'Hide' : '隐藏') : (languageIsEnglish ? 'Show' : '显示')} ${languageIsEnglish ? option.labelEn : option.labelZh}`}
+                          accessibilityRole="switch"
+                          accessibilityState={{ checked: enabled }}
+                          key={option.key}
+                          onPress={() => toggleAudioTagVisibility(option.key)}
+                          style={styles.settingRow}
+                        >
+                          <View style={styles.settingText}>
+                            <Text style={styles.settingTitle}>{languageIsEnglish ? option.labelEn : option.labelZh}</Text>
+                            <Text style={styles.settingDescription}>{languageIsEnglish ? option.descriptionEn : option.descriptionZh}</Text>
+                          </View>
+                          <View style={[styles.switchTrack, enabled ? styles.switchTrackActive : null]}>
+                            <View style={[styles.switchThumb, enabled ? styles.switchThumbActive : null]} />
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
                 </View>
               </View>
             ) : (
@@ -1590,31 +1798,10 @@ function EchoLinkApp(): ReactElement {
                     lyricsVisible ? styles.playerCardLyrics : null,
                   ]}
                 >
-                  <BlurView intensity={32} pointerEvents="none" style={styles.playerCardBlur} tint="light" />
+                  <BlurView intensity={32} pointerEvents="none" style={styles.playerCardBlur} tint="dark" />
                   {lyricsVisible ? (
                     <Animated.View style={[styles.lyricsMode, lyricsPanelAnimatedStyle]}>
-                      <View style={styles.lyricsTopBar}>
-                        {renderArtwork('lyrics')}
-                        <View style={styles.lyricsHeroText}>
-                          <Text style={[styles.trackTitleLyrics, { fontSize: playerTitleSize }]} numberOfLines={2}>
-                            {displayTrack?.title ?? '没有正在播放的歌曲'}
-                          </Text>
-                          <View style={[styles.playbackTagRow, styles.playbackTagRowLyrics]}>
-                            {playbackTags.map((tag) => (
-                              <Text key={tag} style={styles.playbackTag}>{tag}</Text>
-                            ))}
-                          </View>
-                        </View>
-                        <Pressable
-                          accessibilityLabel="关闭歌词显示"
-                          accessibilityRole="button"
-                          onPress={() => setLyricsVisible(false)}
-                          style={styles.lyricsCloseButton}
-                        >
-                          {renderButtonBlur(18)}
-                          <Text style={styles.lyricsCloseText}>×</Text>
-                        </Pressable>
-                      </View>
+                      {renderLyricsHeader()}
 
                       <View
                         onLayout={(event) => setLyricsViewportHeight(event.nativeEvent.layout.height)}
@@ -1661,13 +1848,11 @@ function EchoLinkApp(): ReactElement {
                       </View>
 
                       <View style={styles.lyricsControlPanel}>
-                        {renderOutputSwitch()}
                         <View style={styles.compactControlRow}>
                           {renderProgressScrubber(true)}
                           {renderExpandableVolume()}
                         </View>
                         {renderTransportControls(true)}
-                        {renderSecondaryControls(true)}
                       </View>
                     </Animated.View>
                   ) : (
@@ -1697,16 +1882,7 @@ function EchoLinkApp(): ReactElement {
                         {renderSecondaryControls()}
                       </View>
 
-                      <View style={styles.playerUtilityGrid}>
-                        {renderOutputSwitch()}
-                        <View style={styles.volumePanel}>
-                        <View style={styles.volumeHeader}>
-                          <Text style={styles.cardEyebrow}>VOL</Text>
-                          <Text style={styles.volumeValue}>{volumePercent}%</Text>
-                        </View>
-                        {renderVolumeSlider()}
-                        </View>
-                      </View>
+                      {renderOutputSwitch()}
                     </Animated.View>
                   )}
                 </View>
@@ -1781,7 +1957,7 @@ function EchoLinkApp(): ReactElement {
           ) : null}
 
           <View style={styles.dock}>
-            <BlurView intensity={34} pointerEvents="none" style={styles.dockBlur} tint="light" />
+            <BlurView intensity={34} pointerEvents="none" style={styles.dockBlur} tint="dark" />
             <Pressable
               accessibilityLabel="播放页面"
               accessibilityRole="button"
@@ -1790,7 +1966,7 @@ function EchoLinkApp(): ReactElement {
             >
               {page === 'control' ? renderButtonBlur(16) : null}
               <Text style={[styles.dockIcon, page === 'control' ? styles.dockIconActive : null]}>▷</Text>
-              <Text style={[styles.dockLabel, page === 'control' ? styles.dockLabelActive : null]}>播放</Text>
+              <Text style={[styles.dockLabel, page === 'control' ? styles.dockLabelActive : null]}>{languageIsEnglish ? 'Play' : '播放'}</Text>
             </Pressable>
             <Pressable
               accessibilityLabel="曲库页面"
@@ -1800,7 +1976,7 @@ function EchoLinkApp(): ReactElement {
             >
               {page === 'library' ? renderButtonBlur(16) : null}
               <Text style={[styles.dockIcon, page === 'library' ? styles.dockIconActive : null]}>≋</Text>
-              <Text style={[styles.dockLabel, page === 'library' ? styles.dockLabelActive : null]}>曲库</Text>
+              <Text style={[styles.dockLabel, page === 'library' ? styles.dockLabelActive : null]}>{languageIsEnglish ? 'Library' : '曲库'}</Text>
             </Pressable>
             <Pressable
               accessibilityLabel="连接页面"
@@ -1810,7 +1986,17 @@ function EchoLinkApp(): ReactElement {
             >
               {page === 'connect' ? renderButtonBlur(16) : null}
               <Text style={[styles.dockIcon, page === 'connect' ? styles.dockIconActive : null]}>⌁</Text>
-              <Text style={[styles.dockLabel, page === 'connect' ? styles.dockLabelActive : null]}>连接</Text>
+              <Text style={[styles.dockLabel, page === 'connect' ? styles.dockLabelActive : null]}>{languageIsEnglish ? 'Link' : '连接'}</Text>
+            </Pressable>
+            <Pressable
+              accessibilityLabel="设置页面"
+              accessibilityRole="button"
+              style={[styles.dockItem, page === 'settings' ? styles.dockItemActive : null]}
+              onPress={() => switchPage('settings')}
+            >
+              {page === 'settings' ? renderButtonBlur(16) : null}
+              <Text style={[styles.dockIcon, page === 'settings' ? styles.dockIconActive : null]}>⚙</Text>
+              <Text style={[styles.dockLabel, page === 'settings' ? styles.dockLabelActive : null]}>{languageIsEnglish ? 'Settings' : '设置'}</Text>
             </Pressable>
           </View>
         </View>
@@ -1830,7 +2016,7 @@ export default function App(): ReactElement {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#f6f6f3',
+    backgroundColor: '#101014',
   },
   root: {
     flex: 1,
@@ -1857,7 +2043,7 @@ const styles = StyleSheet.create({
   playerContent: {
     flexGrow: 1,
     justifyContent: 'flex-start',
-    paddingBottom: 118,
+    paddingBottom: 110,
     paddingTop: 4,
   },
   playerContentLyrics: {
@@ -1877,13 +2063,13 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   title: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 34,
     fontWeight: '900',
     letterSpacing: -0.8,
   },
   description: {
-    color: '#666662',
+    color: 'rgba(248, 250, 252, 0.62)',
     fontSize: 15,
     lineHeight: 23,
     maxWidth: 330,
@@ -1891,8 +2077,8 @@ const styles = StyleSheet.create({
   statusPill: {
     alignItems: 'center',
     alignSelf: 'flex-start',
-    backgroundColor: 'rgba(255, 255, 255, 0.62)',
-    borderColor: 'rgba(255, 255, 255, 0.78)',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
@@ -1905,11 +2091,11 @@ const styles = StyleSheet.create({
     shadowRadius: 18,
   },
   statusPillOnline: {
-    backgroundColor: 'rgba(255, 255, 255, 0.86)',
-    borderColor: 'rgba(255, 255, 255, 0.92)',
+    backgroundColor: 'rgba(34, 197, 94, 0.16)',
+    borderColor: 'rgba(34, 197, 94, 0.28)',
   },
   statusPillError: {
-    backgroundColor: 'rgba(254, 242, 242, 0.86)',
+    backgroundColor: 'rgba(127, 29, 29, 0.28)',
     borderColor: 'rgba(248, 113, 113, 0.34)',
   },
   statusDot: {
@@ -1919,18 +2105,18 @@ const styles = StyleSheet.create({
     width: 7,
   },
   statusDotOnline: {
-    backgroundColor: '#27272a',
+    backgroundColor: '#22c55e',
   },
   statusDotError: {
     backgroundColor: '#dc2626',
   },
   statusPillText: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 12,
     fontWeight: '800',
   },
   statusPillTextOnline: {
-    color: '#27272a',
+    color: '#bbf7d0',
   },
   statusPillTextError: {
     color: '#dc2626',
@@ -1948,9 +2134,9 @@ const styles = StyleSheet.create({
     shadowRadius: 24,
   },
   section: {
-    backgroundColor: 'rgba(255, 255, 255, 0.48)',
-    borderColor: 'rgba(255, 255, 255, 0.76)',
-    borderRadius: 26,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 28,
     borderWidth: 1,
     gap: 12,
     padding: 16,
@@ -1967,21 +2153,21 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   cardTitle: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 18,
     fontWeight: '800',
   },
   hint: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 13,
     lineHeight: 19,
   },
   input: {
-    backgroundColor: 'rgba(255, 255, 255, 0.62)',
-    borderColor: 'rgba(39, 39, 42, 0.08)',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderColor: 'rgba(255, 255, 255, 0.14)',
     borderRadius: 18,
     borderWidth: 1,
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 15,
     paddingHorizontal: 14,
     paddingVertical: 12,
@@ -1996,7 +2182,7 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     alignItems: 'center',
-    backgroundColor: '#18181b',
+    backgroundColor: '#22c55e',
     borderRadius: 18,
     flexDirection: 'row',
     gap: 8,
@@ -2012,21 +2198,21 @@ const styles = StyleSheet.create({
     shadowRadius: 22,
   },
   primaryButtonIcon: {
-    color: '#ffffff',
+    color: '#08110b',
     fontSize: 16,
     fontWeight: '900',
     includeFontPadding: false,
     lineHeight: 18,
   },
   primaryButtonText: {
-    color: '#ffffff',
+    color: '#08110b',
     fontSize: 15,
     fontWeight: '800',
   },
   secondaryButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.54)',
-    borderColor: 'rgba(255, 255, 255, 0.76)',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderColor: 'rgba(255, 255, 255, 0.14)',
     borderRadius: 18,
     borderWidth: 1,
     flex: 1,
@@ -2040,20 +2226,87 @@ const styles = StyleSheet.create({
     position: 'relative',
   },
   secondaryButtonIcon: {
-    color: '#27272a',
+    color: '#f8fafc',
     fontSize: 15,
     fontWeight: '900',
     includeFontPadding: false,
     lineHeight: 16,
   },
   secondaryButtonText: {
-    color: '#27272a',
+    color: '#f8fafc',
     fontSize: 14,
     fontWeight: '800',
   },
   buttonRow: {
     flexDirection: 'row',
     gap: 10,
+  },
+  connectPage: {
+    gap: 14,
+  },
+  connectHero: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.14)',
+    borderRadius: 32,
+    borderWidth: 1,
+    gap: 8,
+    overflow: 'hidden',
+    padding: 18,
+  },
+  connectHeroKicker: {
+    color: 'rgba(248, 250, 252, 0.58)',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 1.3,
+    textTransform: 'uppercase',
+  },
+  connectHeroTitle: {
+    color: '#f8fafc',
+    fontSize: 28,
+    fontWeight: '900',
+    letterSpacing: -0.7,
+  },
+  connectHeroText: {
+    color: 'rgba(248, 250, 252, 0.64)',
+    fontSize: 13,
+    lineHeight: 20,
+  },
+  connectMetricRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingTop: 8,
+  },
+  connectMetric: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 18,
+    borderWidth: 1,
+    flex: 1,
+    gap: 3,
+    minHeight: 58,
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  connectMetricValue: {
+    color: '#f8fafc',
+    fontSize: 14,
+    fontWeight: '900',
+    minWidth: 0,
+  },
+  connectMetricLabel: {
+    color: 'rgba(248, 250, 252, 0.5)',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+  },
+  connectPanel: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 28,
+    borderWidth: 1,
+    gap: 12,
+    padding: 16,
   },
   errorBox: {
     backgroundColor: '#fff1f2',
@@ -2092,9 +2345,9 @@ const styles = StyleSheet.create({
   playerCard: {
     alignItems: 'stretch',
     alignSelf: 'stretch',
-    backgroundColor: 'rgba(255, 255, 255, 0.64)',
-    borderColor: 'rgba(255, 255, 255, 0.8)',
-    borderRadius: 32,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 28,
     borderWidth: 1,
     gap: 14,
     overflow: 'hidden',
@@ -2111,7 +2364,7 @@ const styles = StyleSheet.create({
   },
   defaultPlayerMode: {
     alignItems: 'stretch',
-    gap: 14,
+    gap: 10,
     width: '100%',
   },
   lyricsMode: {
@@ -2138,7 +2391,7 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   playerStatusText: {
-    color: '#57534e',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 13,
     fontWeight: '700',
   },
@@ -2148,17 +2401,12 @@ const styles = StyleSheet.create({
   },
   playerControlDeck: {
     alignSelf: 'stretch',
-    backgroundColor: 'rgba(255, 255, 255, 0.48)',
-    borderColor: 'rgba(255, 255, 255, 0.72)',
-    borderRadius: 28,
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 24,
     borderWidth: 1,
-    gap: 10,
-    padding: 12,
-  },
-  playerUtilityGrid: {
-    alignItems: 'stretch',
-    alignSelf: 'stretch',
-    gap: 10,
+    gap: 8,
+    padding: 10,
   },
   lyricsHeroText: {
     flex: 1,
@@ -2194,8 +2442,8 @@ const styles = StyleSheet.create({
   artworkShell: {
     alignItems: 'center',
     alignSelf: 'center',
-    backgroundColor: '#e8e8e4',
-    borderColor: 'rgba(24, 24, 27, 0.08)',
+    backgroundColor: '#232329',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 32,
     borderWidth: 1,
     height: 252,
@@ -2221,7 +2469,7 @@ const styles = StyleSheet.create({
   },
   artworkFallback: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.38)',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
     bottom: 0,
     justifyContent: 'center',
     left: 0,
@@ -2230,7 +2478,7 @@ const styles = StyleSheet.create({
     top: 0,
   },
   artworkFallbackText: {
-    color: '#737373',
+    color: 'rgba(248, 250, 252, 0.32)',
     fontSize: 36,
     fontWeight: '900',
     letterSpacing: 3,
@@ -2240,7 +2488,7 @@ const styles = StyleSheet.create({
     letterSpacing: 2,
   },
   artworkGlow: {
-    backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    backgroundColor: 'rgba(34, 197, 94, 0.52)',
     borderRadius: 999,
     height: 14,
     opacity: 0.42,
@@ -2249,8 +2497,8 @@ const styles = StyleSheet.create({
     width: '58%',
   },
   playerConnectionChip: {
-    backgroundColor: 'rgba(255, 255, 255, 0.74)',
-    borderColor: 'rgba(255, 255, 255, 0.86)',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 18,
     borderWidth: 1,
     gap: 4,
@@ -2274,7 +2522,7 @@ const styles = StyleSheet.create({
     width: 118,
   },
   playerConnectionChipError: {
-    backgroundColor: 'rgba(254, 242, 242, 0.9)',
+    backgroundColor: 'rgba(127, 29, 29, 0.28)',
     borderColor: 'rgba(248, 113, 113, 0.32)',
   },
   playerConnectionKicker: {
@@ -2292,7 +2540,7 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   playerConnectionText: {
-    color: '#27272a',
+    color: '#f8fafc',
     flex: 1,
     fontSize: 12,
     fontWeight: '900',
@@ -2301,7 +2549,7 @@ const styles = StyleSheet.create({
     color: '#dc2626',
   },
   playerConnectionDetail: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.52)',
     fontSize: 10,
     fontWeight: '700',
   },
@@ -2309,7 +2557,7 @@ const styles = StyleSheet.create({
     color: '#b91c1c',
   },
   trackTitle: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 24,
     fontWeight: '900',
     letterSpacing: -0.35,
@@ -2323,36 +2571,48 @@ const styles = StyleSheet.create({
     lineHeight: 30,
   },
   trackMeta: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 14,
     textAlign: 'center',
   },
   playbackTagRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 6,
+    gap: 5,
     justifyContent: 'center',
-    minHeight: 24,
+    minHeight: 22,
   },
   playbackTagRowLyrics: {
     justifyContent: 'flex-start',
     minHeight: 0,
   },
   playbackTag: {
-    borderColor: 'rgba(24, 24, 27, 0.12)',
+    borderColor: 'rgba(255, 255, 255, 0.14)',
     borderRadius: 999,
     borderWidth: 1,
-    color: '#3f3f46',
-    fontSize: 10,
+    color: 'rgba(248, 250, 252, 0.72)',
+    fontSize: 9,
     fontWeight: '800',
     overflow: 'hidden',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  playbackTagDark: {
+    borderColor: 'rgba(255, 255, 255, 0.16)',
+    color: 'rgba(248, 250, 252, 0.76)',
+  },
+  lyricsConnectionText: {
+    color: 'rgba(248, 250, 252, 0.62)',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  lyricsConnectionTextError: {
+    color: '#fca5a5',
   },
   outputSwitch: {
     alignSelf: 'stretch',
-    backgroundColor: 'rgba(255, 255, 255, 0.56)',
-    borderColor: 'rgba(39, 39, 42, 0.08)',
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 24,
     borderWidth: 1,
     flexDirection: 'row',
@@ -2366,26 +2626,26 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 20,
     flex: 1,
-    minHeight: 42,
+    minHeight: 38,
     justifyContent: 'center',
     overflow: 'hidden',
     paddingHorizontal: 10,
     position: 'relative',
   },
   outputSwitchButtonActive: {
-    backgroundColor: '#ffffff',
+    backgroundColor: 'rgba(34, 197, 94, 0.18)',
     shadowColor: '#18181b',
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.08,
     shadowRadius: 10,
   },
   outputSwitchText: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 13,
     fontWeight: '800',
   },
   outputSwitchTextActive: {
-    color: '#18181b',
+    color: '#bbf7d0',
   },
   phoneAudioError: {
     alignSelf: 'stretch',
@@ -2395,9 +2655,9 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   progressTrack: {
-    backgroundColor: 'rgba(24, 24, 27, 0.12)',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 999,
-    height: 8,
+    height: 7,
     overflow: 'hidden',
     width: '100%',
   },
@@ -2406,15 +2666,15 @@ const styles = StyleSheet.create({
   },
   sliderTouchArea: {
     justifyContent: 'center',
-    minHeight: 42,
+    minHeight: 36,
     position: 'relative',
     width: '100%',
   },
   compactSliderTouchArea: {
-    minHeight: 40,
+    minHeight: 36,
   },
   progressFill: {
-    backgroundColor: '#18181b',
+    backgroundColor: '#22c55e',
     borderRadius: 999,
     height: '100%',
   },
@@ -2434,13 +2694,13 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   progressText: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.52)',
     fontSize: 11,
     fontVariant: ['tabular-nums'],
   },
   lyricsControlPanel: {
     alignSelf: 'stretch',
-    gap: 12,
+    gap: 10,
     paddingTop: 2,
   },
   compactControlRow: {
@@ -2454,7 +2714,7 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 28,
     borderWidth: 1,
-    minHeight: 278,
+    minHeight: 238,
     overflow: 'hidden',
     shadowColor: '#18181b',
     shadowOffset: { width: 0, height: 20 },
@@ -2502,7 +2762,7 @@ const styles = StyleSheet.create({
   transportRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 16,
+    gap: 18,
     justifyContent: 'center',
     width: '100%',
   },
@@ -2513,8 +2773,8 @@ const styles = StyleSheet.create({
   secondaryControlsRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 10,
-    justifyContent: 'center',
+    gap: 8,
+    justifyContent: 'space-between',
     width: '100%',
   },
   secondaryControlsRowCompact: {
@@ -2523,11 +2783,11 @@ const styles = StyleSheet.create({
   },
   roundButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.7)',
-    borderColor: 'rgba(255, 255, 255, 0.84)',
+    backgroundColor: 'rgba(255, 255, 255, 0.09)',
+    borderColor: 'rgba(255, 255, 255, 0.13)',
     borderRadius: 999,
     borderWidth: 1,
-    height: 54,
+    height: 50,
     justifyContent: 'center',
     overflow: 'hidden',
     position: 'relative',
@@ -2535,18 +2795,18 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.08,
     shadowRadius: 16,
-    width: 54,
+    width: 50,
   },
   roundButtonLyrics: {
     height: 54,
     width: 54,
   },
   roundButtonText: {
-    color: '#27272a',
-    fontSize: 34,
+    color: '#f8fafc',
+    fontSize: 24,
     fontWeight: '900',
     includeFontPadding: false,
-    lineHeight: 38,
+    lineHeight: 28,
     textAlign: 'center',
   },
   roundButtonTextLyrics: {
@@ -2554,9 +2814,9 @@ const styles = StyleSheet.create({
   },
   playButton: {
     alignItems: 'center',
-    backgroundColor: '#18181b',
+    backgroundColor: '#f8fafc',
     borderRadius: 999,
-    height: 86,
+    height: 78,
     justifyContent: 'center',
     overflow: 'hidden',
     position: 'relative',
@@ -2564,14 +2824,14 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 14 },
     shadowOpacity: 0.2,
     shadowRadius: 24,
-    width: 86,
+    width: 78,
   },
   playButtonLyrics: {
-    height: 88,
-    width: 88,
+    height: 82,
+    width: 82,
   },
   playButtonText: {
-    color: '#ffffff',
+    color: '#101014',
     fontSize: 30,
     fontWeight: '900',
     includeFontPadding: false,
@@ -2586,26 +2846,26 @@ const styles = StyleSheet.create({
   },
   repeatButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.66)',
-    borderColor: 'rgba(255, 255, 255, 0.82)',
+    backgroundColor: 'rgba(255, 255, 255, 0.09)',
+    borderColor: 'rgba(255, 255, 255, 0.13)',
     borderRadius: 999,
     borderWidth: 1,
-    height: 48,
+    height: 44,
     justifyContent: 'center',
     overflow: 'hidden',
     position: 'relative',
-    width: 48,
+    width: 44,
   },
   repeatButtonCompact: {
     height: 42,
     width: 42,
   },
   repeatButtonActive: {
-    backgroundColor: '#18181b',
-    borderColor: '#18181b',
+    backgroundColor: 'rgba(34, 197, 94, 0.2)',
+    borderColor: 'rgba(34, 197, 94, 0.42)',
   },
   repeatButtonIcon: {
-    color: '#27272a',
+    color: '#f8fafc',
     fontSize: 21,
     fontWeight: '900',
     includeFontPadding: false,
@@ -2628,26 +2888,26 @@ const styles = StyleSheet.create({
   },
   lyricsButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.66)',
-    borderColor: 'rgba(255, 255, 255, 0.82)',
+    backgroundColor: 'rgba(255, 255, 255, 0.09)',
+    borderColor: 'rgba(255, 255, 255, 0.13)',
     borderRadius: 999,
     borderWidth: 1,
-    height: 48,
+    height: 44,
     justifyContent: 'center',
     overflow: 'hidden',
     position: 'relative',
-    width: 48,
+    width: 44,
   },
   lyricsButtonCompact: {
     height: 42,
     width: 42,
   },
   lyricsButtonActive: {
-    backgroundColor: '#18181b',
-    borderColor: '#18181b',
+    backgroundColor: 'rgba(34, 197, 94, 0.2)',
+    borderColor: 'rgba(34, 197, 94, 0.42)',
   },
   lyricsButtonText: {
-    color: '#27272a',
+    color: '#f8fafc',
     fontSize: 17,
     fontWeight: '900',
     includeFontPadding: false,
@@ -2659,17 +2919,17 @@ const styles = StyleSheet.create({
   },
   playlistMiniButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.66)',
-    borderColor: 'rgba(255, 255, 255, 0.82)',
+    backgroundColor: 'rgba(255, 255, 255, 0.09)',
+    borderColor: 'rgba(255, 255, 255, 0.13)',
     borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
     gap: 5,
-    height: 48,
+    height: 44,
     justifyContent: 'center',
     overflow: 'hidden',
-    minWidth: 62,
-    paddingHorizontal: 13,
+    minWidth: 58,
+    paddingHorizontal: 11,
     position: 'relative',
     shadowColor: '#18181b',
     shadowOffset: { width: 0, height: 8 },
@@ -2682,18 +2942,18 @@ const styles = StyleSheet.create({
     paddingHorizontal: 11,
   },
   playlistMiniButtonActive: {
-    backgroundColor: '#ffffff',
-    borderColor: 'rgba(24, 24, 27, 0.18)',
+    backgroundColor: 'rgba(34, 197, 94, 0.2)',
+    borderColor: 'rgba(34, 197, 94, 0.42)',
   },
   playlistMiniIcon: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 16,
     fontWeight: '900',
     includeFontPadding: false,
     lineHeight: 19,
   },
   playlistMiniCount: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 12,
     fontVariant: ['tabular-nums'],
     fontWeight: '900',
@@ -2710,7 +2970,7 @@ const styles = StyleSheet.create({
     zIndex: 20,
   },
   playlistBackdrop: {
-    backgroundColor: 'rgba(245, 245, 245, 0.38)',
+    backgroundColor: 'rgba(0, 0, 0, 0.48)',
     bottom: 0,
     left: 0,
     position: 'absolute',
@@ -2719,8 +2979,8 @@ const styles = StyleSheet.create({
   },
   playlistPopover: {
     alignSelf: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.92)',
-    borderColor: 'rgba(39, 39, 42, 0.1)',
+    backgroundColor: 'rgba(24, 24, 27, 0.94)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 24,
     borderWidth: 1,
     maxHeight: 380,
@@ -2745,20 +3005,20 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   playlistPopoverTitle: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 19,
     fontWeight: '900',
   },
   playlistCloseButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(244, 244, 245, 0.92)',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
     borderRadius: 999,
     height: 34,
     justifyContent: 'center',
     width: 34,
   },
   playlistCloseText: {
-    color: '#3f3f46',
+    color: '#f8fafc',
     fontSize: 22,
     fontWeight: '600',
     lineHeight: 24,
@@ -2768,7 +3028,7 @@ const styles = StyleSheet.create({
   },
   playlistItem: {
     alignItems: 'center',
-    borderBottomColor: 'rgba(39, 39, 42, 0.07)',
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)',
     borderBottomWidth: 1,
     flexDirection: 'row',
     gap: 12,
@@ -2776,7 +3036,7 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   playlistItemActive: {
-    backgroundColor: 'rgba(24, 24, 27, 0.06)',
+    backgroundColor: 'rgba(34, 197, 94, 0.14)',
     borderRadius: 14,
     borderBottomWidth: 0,
     paddingHorizontal: 10,
@@ -2789,26 +3049,26 @@ const styles = StyleSheet.create({
     width: 24,
   },
   playlistIndexActive: {
-    color: '#18181b',
+    color: '#bbf7d0',
   },
   playlistText: {
     flex: 1,
     gap: 2,
   },
   playlistTitle: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 14,
     fontWeight: '800',
   },
   playlistTitleActive: {
-    color: '#18181b',
+    color: '#bbf7d0',
   },
   playlistMeta: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.54)',
     fontSize: 12,
   },
   playlistEmpty: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 13,
     lineHeight: 19,
     paddingVertical: 10,
@@ -2826,52 +3086,38 @@ const styles = StyleSheet.create({
     marginTop: 4,
     width: '100%',
   },
-  volumePanel: {
-    gap: 6,
-    width: '100%',
-  },
-  volumeHeader: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  volumeValue: {
-    color: '#18181b',
-    fontSize: 14,
-    fontWeight: '900',
-  },
   volumeTrack: {
-    backgroundColor: '#e5e5e5',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 999,
     height: 12,
     overflow: 'hidden',
   },
   compactVolumeTrack: {
-    backgroundColor: 'rgba(228, 228, 231, 0.92)',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
     height: 7,
   },
   volumeFill: {
-    backgroundColor: '#18181b',
+    backgroundColor: '#22c55e',
     borderRadius: 999,
     height: '100%',
   },
   compactVolumeShell: {
     alignItems: 'flex-end',
     gap: 7,
-    minWidth: 92,
+    minWidth: 84,
   },
   volumeMiniButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.74)',
-    borderColor: 'rgba(255, 255, 255, 0.86)',
+    backgroundColor: 'rgba(255, 255, 255, 0.09)',
+    borderColor: 'rgba(255, 255, 255, 0.13)',
     borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
     gap: 6,
-    height: 40,
+    height: 44,
     justifyContent: 'center',
     overflow: 'hidden',
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     position: 'relative',
     shadowColor: '#18181b',
     shadowOffset: { width: 0, height: 8 },
@@ -2879,41 +3125,147 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
   },
   volumeMiniButtonActive: {
-    backgroundColor: '#ffffff',
-    borderColor: 'rgba(24, 24, 27, 0.1)',
+    backgroundColor: 'rgba(34, 197, 94, 0.18)',
+    borderColor: 'rgba(34, 197, 94, 0.38)',
   },
   volumeMiniIcon: {
-    color: '#71717a',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 10,
     fontWeight: '900',
     letterSpacing: 0.7,
   },
   volumeMiniValue: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 12,
     fontVariant: ['tabular-nums'],
     fontWeight: '900',
   },
   volumeExpandedPanel: {
-    backgroundColor: 'rgba(255, 255, 255, 0.78)',
-    borderColor: 'rgba(255, 255, 255, 0.88)',
+    backgroundColor: 'rgba(255, 255, 255, 0.09)',
+    borderColor: 'rgba(255, 255, 255, 0.13)',
     borderRadius: 999,
     borderWidth: 1,
     paddingHorizontal: 12,
     paddingVertical: 5,
-    width: 112,
+    width: 104,
   },
   libraryList: {
-    gap: 0,
+    gap: 10,
   },
   libraryPage: {
+    gap: 14,
+  },
+  settingsPage: {
+    gap: 14,
+  },
+  settingsPanel: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 28,
+    borderWidth: 1,
     gap: 12,
+    padding: 16,
+  },
+  segmentRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  segmentButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 999,
+    borderWidth: 1,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 42,
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  segmentButtonActive: {
+    backgroundColor: 'rgba(34, 197, 94, 0.22)',
+    borderColor: 'rgba(34, 197, 94, 0.42)',
+  },
+  segmentButtonText: {
+    color: 'rgba(248, 250, 252, 0.58)',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  segmentButtonTextActive: {
+    color: '#f8fafc',
+  },
+  settingsList: {
+    gap: 8,
+  },
+  settingRow: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 20,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 12,
+    minHeight: 62,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  settingText: {
+    flex: 1,
+    gap: 3,
+    minWidth: 0,
+  },
+  settingTitle: {
+    color: '#f8fafc',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  settingDescription: {
+    color: 'rgba(248, 250, 252, 0.56)',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  switchTrack: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+    borderRadius: 999,
+    height: 30,
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+    width: 52,
+  },
+  switchTrackActive: {
+    backgroundColor: 'rgba(34, 197, 94, 0.86)',
+  },
+  switchThumb: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#f8fafc',
+    borderRadius: 999,
+    height: 24,
+    width: 24,
+  },
+  switchThumbActive: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#08110b',
+  },
+  libraryHero: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 32,
+    borderWidth: 1,
+    gap: 7,
+    padding: 18,
+  },
+  libraryHeroTitle: {
+    color: '#f8fafc',
+    fontSize: 30,
+    fontWeight: '900',
+    letterSpacing: -0.8,
   },
   librarySearchRow: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.46)',
-    borderColor: 'rgba(255, 255, 255, 0.74)',
-    borderRadius: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 26,
     borderWidth: 1,
     flexDirection: 'row',
     gap: 8,
@@ -2931,8 +3283,8 @@ const styles = StyleSheet.create({
   },
   libraryRefreshButton: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.62)',
-    borderColor: 'rgba(255, 255, 255, 0.82)',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    borderColor: 'rgba(255, 255, 255, 0.16)',
     borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
@@ -2944,31 +3296,61 @@ const styles = StyleSheet.create({
     position: 'relative',
   },
   libraryRefreshIcon: {
-    color: '#27272a',
+    color: '#f8fafc',
     fontSize: 15,
     fontWeight: '900',
     includeFontPadding: false,
     lineHeight: 16,
   },
   libraryRefreshText: {
-    color: '#27272a',
+    color: '#f8fafc',
     fontSize: 14,
     fontWeight: '800',
   },
+  libraryFilterRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  libraryFilterChip: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 999,
+    borderWidth: 1,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 38,
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  libraryFilterChipActive: {
+    backgroundColor: 'rgba(34, 197, 94, 0.22)',
+    borderColor: 'rgba(34, 197, 94, 0.42)',
+  },
+  libraryFilterText: {
+    color: 'rgba(248, 250, 252, 0.58)',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  libraryFilterTextActive: {
+    color: '#f8fafc',
+  },
   trackRow: {
     alignItems: 'center',
-    borderBottomColor: 'rgba(39, 39, 42, 0.065)',
-    borderBottomWidth: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 22,
+    borderWidth: 1,
     flexDirection: 'row',
     gap: 13,
     minHeight: 72,
-    paddingHorizontal: 2,
+    paddingHorizontal: 10,
     paddingVertical: 12,
   },
   libraryArtwork: {
     alignItems: 'center',
-    backgroundColor: '#eeeeeb',
-    borderColor: 'rgba(255, 255, 255, 0.82)',
+    backgroundColor: '#232329',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 14,
     borderWidth: 1,
     height: 46,
@@ -2996,7 +3378,7 @@ const styles = StyleSheet.create({
     top: 0,
   },
   libraryArtworkText: {
-    color: '#71717a',
+    color: 'rgba(248, 250, 252, 0.36)',
     fontSize: 16,
     fontWeight: '900',
   },
@@ -3018,12 +3400,12 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   listTitle: {
-    color: '#18181b',
+    color: '#f8fafc',
     fontSize: 15,
     fontWeight: '800',
   },
   listMeta: {
-    color: '#706b66',
+    color: 'rgba(248, 250, 252, 0.58)',
     fontSize: 12,
   },
   libraryTagRow: {
@@ -3032,10 +3414,10 @@ const styles = StyleSheet.create({
     gap: 5,
   },
   libraryTag: {
-    borderColor: 'rgba(24, 24, 27, 0.12)',
+    borderColor: 'rgba(255, 255, 255, 0.14)',
     borderRadius: 999,
     borderWidth: 1,
-    color: '#52525b',
+    color: 'rgba(248, 250, 252, 0.68)',
     fontSize: 10,
     fontWeight: '800',
     overflow: 'hidden',
@@ -3043,7 +3425,7 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   playInline: {
-    color: '#52525b',
+    color: '#22c55e',
     fontSize: 20,
     fontWeight: '900',
     includeFontPadding: false,
@@ -3052,8 +3434,8 @@ const styles = StyleSheet.create({
   dock: {
     alignItems: 'center',
     alignSelf: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.42)',
-    borderColor: 'rgba(255, 255, 255, 0.88)',
+    backgroundColor: 'rgba(16, 16, 20, 0.72)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
     borderRadius: 36,
     borderWidth: 1,
     bottom: 14,
@@ -3081,16 +3463,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 26,
     flex: 1,
-    gap: 4,
-    minHeight: 58,
+    gap: 3,
+    minHeight: 54,
     justifyContent: 'center',
     overflow: 'hidden',
     paddingVertical: 9,
     position: 'relative',
   },
   dockItemActive: {
-    backgroundColor: 'rgba(255, 255, 255, 0.74)',
-    borderColor: 'rgba(24, 24, 27, 0.06)',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    borderColor: 'rgba(255, 255, 255, 0.14)',
     borderWidth: 1,
     shadowColor: '#18181b',
     shadowOffset: { width: 0, height: 8 },
@@ -3098,21 +3480,21 @@ const styles = StyleSheet.create({
     shadowRadius: 18,
   },
   dockIcon: {
-    color: '#77736d',
-    fontSize: 20,
+    color: 'rgba(248, 250, 252, 0.5)',
+    fontSize: 18,
     fontWeight: '900',
     includeFontPadding: false,
     lineHeight: 23,
   },
   dockIconActive: {
-    color: '#18181b',
+    color: '#f8fafc',
   },
   dockLabel: {
-    color: '#77736d',
-    fontSize: 11,
+    color: 'rgba(248, 250, 252, 0.5)',
+    fontSize: 10,
     fontWeight: '800',
   },
   dockLabelActive: {
-    color: '#18181b',
+    color: '#f8fafc',
   },
 });

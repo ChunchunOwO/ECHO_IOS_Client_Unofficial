@@ -18,34 +18,28 @@
 
 ## What It Is
 
-ECHO iPhone turns an iPhone into a lightweight music-player client for the ECHO NEXT desktop app. It connects through EchoLink, browses the PC library, controls playback, shows live status, and can stream supported tracks to the phone.
+ECHO iPhone is an unofficial iPhone client for ECHO NEXT. It connects to the desktop app through EchoLink so the phone can show current playback, control playback, browse the library, and stream supported local audio from the PC to the iPhone.
 
-This release focuses on a full UI refresh: the playback page is denser and more polished, the lyrics view now feels like a proper reading screen, and the dock uses a unified glass style.
+It is not a standalone player. The desktop app still owns the library, queue, lyrics, artwork, and audio metadata. The iPhone app handles control, display, and phone-side streaming.
 
-## Highlights
+## Main Features
 
-- EchoLink pairing URI support and manual LAN connection.
-- Three pages: Playback, Library, and Connection.
-- Swipe navigation plus a redesigned bottom dock.
-- Full-screen playback layout with denser controls.
-- Glassmorphism controls powered by `expo-blur`.
-- Lyrics mode with large text, auto-scroll, and active-line highlighting.
-- Tap-to-seek for timestamped lyrics.
-- Stable artwork loading that avoids flicker.
-- Drag progress and volume controls with gesture lock to prevent interruptions.
-- Previous, play/pause, next, repeat-one, and queue preview.
-- Library search and PC playback entry.
-- Artwork loading with fallback behavior.
-- Control / stream output switch.
-- Metadata tags when EchoLink provides them.
+- Playback: play / pause, previous, next, seek, and volume control.
+- Lyrics: loads desktop lyrics, supports LRC auto-scroll and tap-to-seek.
+- Library: browse the PC library, search tracks, filter all / streamable / local.
+- Streaming: supported local audio can be streamed from the PC to the phone.
+- Queue: preview the current queue from the playback page.
+- Audio tags: Local, streamable, WASAPI / ASIO, FLAC 48kHz/24bit, bitrate, duration, and related metadata.
+- Settings: choose Chinese / English and choose which audio tags are shown.
+- Connection: supports `echo://pair?...` pairing links and manual Host, Port, Token input.
 
 ## Requirements
 
-- Node.js and npm
-- Expo via `npx expo`
-- macOS + Xcode for local iOS builds
-- GitHub Actions for unsigned IPA generation on Windows
-- A signing/install method such as Sideloadly or AltStore for device testing
+- ECHO NEXT must be running on the desktop with EchoLink enabled.
+- iPhone and PC must be on the same LAN.
+- Windows Firewall must allow ECHO NEXT network access.
+- Phone streaming depends on the desktop stream API and audio formats supported by iOS.
+- Artwork, lyrics, and audio tags depend on data returned by the desktop app.
 
 ## Run Locally
 
@@ -57,16 +51,16 @@ npm run start
 Type check:
 
 ```powershell
-npm run typecheck
+npm.cmd run typecheck
 ```
 
 iOS export check:
 
 ```powershell
-npx expo export --platform ios --output-dir build\export-check
+npx.cmd expo export --platform ios --output-dir build\export-check
 ```
 
-## Connect to ECHO NEXT
+## Connect to the Desktop App
 
 Pairing URI example:
 
@@ -76,11 +70,30 @@ echo://pair?host=192.168.1.12&port=26789&token=...
 
 Manual fields:
 
-- Host: PC LAN IP
+- Host: PC LAN IP, for example `192.168.2.27`
 - Port: usually `26789`
-- Token: copied from the desktop EchoLink pairing screen
+- Token: copied from the ECHO NEXT EchoLink pairing screen
 
 If connection fails, check LAN, firewall, EchoLink status, host IP, and iOS local network permission.
+
+## EchoLink Endpoints Used
+
+```text
+GET  /echo-link/v1/status
+GET  /echo-link/v1/library/tracks
+GET  /echo-link/v1/library/albums
+GET  /echo-link/v1/library/albums/:albumId/tracks
+POST /echo-link/v1/playback/command
+POST /echo-link/v1/library/tracks/:trackId/stream
+GET  /echo-link/v1/library/tracks/:trackId/lyrics
+```
+
+Headers:
+
+```text
+Authorization: Bearer <token>
+x-echo-link-version: 1
+```
 
 ## Build Unsigned IPA
 
@@ -96,6 +109,68 @@ Local Mac:
 ```bash
 bash scripts/build-unsigned-ipa-for-sideloadly.sh
 ```
+
+Output:
+
+```text
+build/ios-unsigned/ECHO-iPhone-unsigned.ipa
+```
+
+### Xcode Free Apple ID
+
+```bash
+bash scripts/build-free-apple-id-with-xcode.sh
+```
+
+The script opens the generated Xcode workspace. Select your Apple ID Team, connect the iPhone, then Run.
+
+## Assets
+
+- `docs/app-icon.png` is used by both README and Expo as the current app icon.
+- `docs/app-icon.svg` is a lightweight display version of the same icon.
+- `docs/preview.svg` is the README preview image.
+- `Assets.car` can be placed at the repository root. The unsigned IPA script copies it into the final `.app`.
+- Track artwork is loaded from EchoLink artwork URLs. If loading fails, the app keeps the stable artwork or shows the ECHO fallback.
+
+## Project Structure
+
+```text
+App.tsx                         Main UI, playback controls, lyrics, and streaming logic
+app.json                        Expo iOS config
+src/echoLink/client.ts          EchoLink HTTP client
+src/echoLink/types.ts           Mobile EchoLink types
+src/echoLink/pairing.ts         Pairing URI parser
+src/storage/connectionStore.ts  Local connection storage
+scripts/                        iOS build helper scripts
+.github/workflows/              Unsigned IPA workflow
+docs/                           Icons, preview image, and README assets
+```
+
+## Upload Checklist
+
+Recommended:
+
+- `.github/workflows/build-ios-unsigned.yml`
+- `.gitattributes`
+- `.gitignore`
+- `app.json`
+- `App.tsx`
+- `Assets.car`
+- `package.json`
+- `package-lock.json`
+- `README.md`
+- `README.en.md`
+- `RELEASE_NOTES.md`
+- `tsconfig.json`
+- `docs/`
+- `scripts/`
+- `src/`
+
+Do not upload:
+
+- `node_modules/`
+- `build/`
+- Generated `.ipa` files
 
 ## Release Notes
 
