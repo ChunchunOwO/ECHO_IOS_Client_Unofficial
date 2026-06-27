@@ -1,11 +1,13 @@
 import AVFoundation
+import AVFAudio
+import AudioToolbox
 import ExpoModulesCore
 
 private final class DspPlaybackEngine {
   private let engine = AVAudioEngine()
   private let player = AVAudioPlayerNode()
   private let eq = AVAudioUnitEQ(numberOfBands: 5)
-  private let dynamics = AVAudioUnitDynamicsProcessor()
+  private let dynamics = DspPlaybackEngine.makeDynamicsProcessor()
   private var audioFile: AVAudioFile?
   private var sampleRate: Double = 44_100
   private var durationSeconds: Double = 0
@@ -17,14 +19,7 @@ private final class DspPlaybackEngine {
 
   init() {
     configureEqBands([0, 0, 0, 0, 0])
-    dynamics.bypass = true
-    dynamics.threshold = -18
-    dynamics.headRoom = 5
-    dynamics.expansionRatio = 1
-    dynamics.expansionThreshold = -48
-    dynamics.attackTime = 0.008
-    dynamics.releaseTime = 0.18
-    dynamics.masterGain = 2
+    configureDynamicsProcessor()
   }
 
   func playFile(uri: String, positionMs: Double, volume: Double, gains: [Double], loudnessEnabled: Bool) throws {
@@ -43,7 +38,7 @@ private final class DspPlaybackEngine {
 
     configureGraph(format: file.processingFormat)
     configureEqBands(gains)
-    dynamics.bypass = !loudnessEnabled
+    dynamics?.bypass = !loudnessEnabled
     player.volume = Float(max(0, min(1, volume)))
 
     player.stop()
@@ -113,7 +108,7 @@ private final class DspPlaybackEngine {
   }
 
   func setLoudness(_ enabled: Bool) {
-    dynamics.bypass = !enabled
+    dynamics?.bypass = !enabled
   }
 
   func status() -> [String: Any] {
@@ -138,16 +133,24 @@ private final class DspPlaybackEngine {
     if !configured {
       engine.attach(player)
       engine.attach(eq)
-      engine.attach(dynamics)
+      if let dynamics {
+        engine.attach(dynamics)
+      }
       configured = true
     }
 
     engine.disconnectNodeOutput(player)
     engine.disconnectNodeOutput(eq)
-    engine.disconnectNodeOutput(dynamics)
+    if let dynamics {
+      engine.disconnectNodeOutput(dynamics)
+    }
     engine.connect(player, to: eq, format: format)
-    engine.connect(eq, to: dynamics, format: format)
-    engine.connect(dynamics, to: engine.mainMixerNode, format: format)
+    if let dynamics {
+      engine.connect(eq, to: dynamics, format: format)
+      engine.connect(dynamics, to: engine.mainMixerNode, format: format)
+    } else {
+      engine.connect(eq, to: engine.mainMixerNode, format: format)
+    }
   }
 
   private func scheduleCurrentFile(shouldMarkFinished: Bool) {
@@ -199,6 +202,48 @@ private final class DspPlaybackEngine {
     }
     eq.globalGain = 0
   }
+
+  private static func makeDynamicsProcessor() -> AVAudioUnitEffect? {
+    AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
+      componentType: kAudioUnitType_Effect,
+      componentSubType: kAudioUnitSubType_DynamicsProcessor,
+      componentManufacturer: kAudioUnitManufacturer_Apple,
+      componentFlags: 0,
+      componentFlagsMask: 0
+    ))
+  }
+
+  private func configureDynamicsProcessor() {
+    guard let dynamics else { return }
+    dynamics.bypass = true
+    setDynamicsParameter(DynamicsParameter.threshold, value: -18)
+    setDynamicsParameter(DynamicsParameter.headRoom, value: 5)
+    setDynamicsParameter(DynamicsParameter.expansionRatio, value: 1)
+    setDynamicsParameter(DynamicsParameter.expansionThreshold, value: -48)
+    setDynamicsParameter(DynamicsParameter.attackTime, value: 0.008)
+    setDynamicsParameter(DynamicsParameter.releaseTime, value: 0.18)
+    setDynamicsParameter(DynamicsParameter.masterGain, value: 2)
+  }
+
+  private func setDynamicsParameter(_ parameterID: AudioUnitParameterID, value: Float) {
+    guard
+      let dynamics,
+      let parameter = dynamics.auAudioUnit.parameterTree?.parameter(withAddress: AUParameterAddress(parameterID))
+    else {
+      return
+    }
+    parameter.value = value
+  }
+}
+
+private enum DynamicsParameter {
+  static let threshold: AudioUnitParameterID = 0
+  static let headRoom: AudioUnitParameterID = 1
+  static let expansionRatio: AudioUnitParameterID = 2
+  static let expansionThreshold: AudioUnitParameterID = 3
+  static let attackTime: AudioUnitParameterID = 4
+  static let releaseTime: AudioUnitParameterID = 5
+  static let masterGain: AudioUnitParameterID = 6
 }
 
 private enum DspError: Error {
